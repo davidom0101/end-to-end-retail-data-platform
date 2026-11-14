@@ -1,8 +1,12 @@
 import argparse
 import json
 import os
+import sys
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from retail_pipeline.manifest import ManifestValidationError, validate_snapshot_manifest
 
 
 @dataclass(frozen=True)
@@ -18,7 +22,8 @@ class PipelineSettings:
 def parse_settings(argv: list[str] | None = None) -> PipelineSettings:
     """Read pipeline settings, with CLI values overriding environment values."""
     parser = argparse.ArgumentParser(
-        description="Display the pipeline configuration without connecting to AWS."
+        description="Display the pipeline configuration without connecting to AWS.",
+        epilog="Use 'retail-pipeline validate-manifest MANIFEST' to verify a snapshot.",
     )
     options = (
         ("--dataset-path", "RETAIL_DATASET_PATH", "Local dataset directory"),
@@ -55,7 +60,41 @@ def parse_settings(argv: list[str] | None = None) -> PipelineSettings:
 
 
 def main() -> None:
-    settings = parse_settings()
+    arguments = sys.argv[1:]
+    if arguments[:1] == ["validate-manifest"]:
+        _validate_manifest_command(arguments[1:])
+        return
+
+    settings = parse_settings(arguments)
     output = asdict(settings)
     output["dataset_path"] = str(settings.dataset_path)
     print(json.dumps(output, indent=2))
+
+
+def _validate_manifest_command(arguments: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="retail-pipeline validate-manifest",
+        description="Verify one historical v1 snapshot locally.",
+    )
+    parser.add_argument("manifest", type=Path)
+    args = parser.parse_args(arguments)
+    try:
+        snapshot = validate_snapshot_manifest(args.manifest)
+    except ManifestValidationError as exc:
+        parser.exit(1, f"{parser.prog}: {exc}\n")
+
+    counts: Counter[str] = Counter()
+    for file in snapshot.files:
+        counts[file.entity_type] += file.row_count
+    print(
+        json.dumps(
+            {
+                "dataset_id": snapshot.dataset_id,
+                "batch_id": snapshot.batch_id,
+                "manifest_sha256": snapshot.sha256,
+                "file_count": len(snapshot.files),
+                "row_counts": counts,
+            },
+            indent=2,
+        )
+    )
