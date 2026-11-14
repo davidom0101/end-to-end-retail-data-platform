@@ -3,16 +3,18 @@
 import json
 import re
 from collections import Counter
-from contextlib import closing
 from dataclasses import dataclass
 from time import monotonic, sleep
-from typing import BinaryIO, Protocol, TypedDict
+from typing import Protocol, TypedDict
 
-from retail_pipeline.manifest import (
-    SNAPSHOT_LAYOUTS,
-    SnapshotDelivery,
-    parse_snapshot_manifest,
+from retail_pipeline.discovery import (
+    DeliverySelectionError,
+    PublishedDelivery,
+    SnapshotSource,
+    read_published_delivery,
+    read_s3_object,
 )
+from retail_pipeline.manifest import SNAPSHOT_LAYOUTS
 
 _REDSHIFT_TYPES = {
     "string": "VARCHAR(65535)",
@@ -22,10 +24,6 @@ _REDSHIFT_TYPES = {
     "money": "DECIMAL(12,2)",
     "bool": "BOOLEAN",
 }
-_SOURCE_URI = re.compile(
-    r"s3://([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])/"
-    r"(raw/[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*)/manifest\.json"
-)
 
 
 class _Statement(TypedDict, total=False):
@@ -39,14 +37,6 @@ class _Statement(TypedDict, total=False):
 
 class _StatementResult(TypedDict):
     Records: list[list[dict[str, str | int]]]
-
-
-class _S3Object(TypedDict):
-    Body: BinaryIO
-
-
-class SnapshotSource(Protocol):
-    def get_object(self, *, Bucket: str, Key: str) -> _S3Object: ...
 
 
 class RedshiftClient(Protocol):
@@ -67,14 +57,6 @@ class RedshiftClient(Protocol):
 
 class SnapshotStagingError(ValueError):
     """A published delivery could not be staged or verified."""
-
-
-@dataclass(frozen=True)
-class PublishedSnapshot:
-    source_manifest_uri: str
-    bucket: str
-    prefix: str
-    delivery: SnapshotDelivery
 
 
 @dataclass(frozen=True)
@@ -99,19 +81,12 @@ class LoadedSnapshot:
 
 def read_published_snapshot(
     s3: SnapshotSource, source_manifest_uri: str
-) -> PublishedSnapshot:
+) -> PublishedDelivery:
     """Read the historical manifest and check that its IDs match the S3 key."""
-    location = _SOURCE_URI.fullmatch(source_manifest_uri)
-    if location is None:
-        raise SnapshotStagingError(
-            "Expected s3://<bucket>/raw/<dataset-id>/<batch-id>/manifest.json"
-        )
-    bucket, prefix = location.groups()
-    source_bytes = _read_object(s3, bucket, f"{prefix}/manifest.json")
-    delivery = parse_snapshot_manifest(source_bytes)
-    if prefix != f"raw/{delivery.dataset_id}/{delivery.batch_id}":
-        raise SnapshotStagingError("Manifest IDs do not match its S3 key")
-    return PublishedSnapshot(source_manifest_uri, bucket, prefix, delivery)
+    try:
+        return read_published_delivery(s3, source_manifest_uri, historical_only=True)
+    except DeliverySelectionError as exc:
+        raise SnapshotStagingError(str(exc)) from exc
 
 
 def stage_snapshot(
@@ -160,7 +135,7 @@ def load_snapshot(
 def stage_snapshot_for_load(
     s3: SnapshotSource,
     redshift: RedshiftClient,
-    published: PublishedSnapshot,
+    published: PublishedDelivery,
     *,
     workgroup: str,
     database: str,
@@ -168,6 +143,8 @@ def stage_snapshot_for_load(
 ) -> StagedSnapshotLoad:
     """Verify staging counts and keep the session open for the core transaction."""
     _validate_core_schema(core_schema)
+    if published.delivery.kind != "historical":
+        raise SnapshotStagingError("Expected a historical snapshot manifest")
     staged, session_id = _stage_snapshot(
         s3,
         redshift,
@@ -224,7 +201,7 @@ def _validate_core_schema(core_schema: str) -> None:
 def _stage_snapshot(
     s3: SnapshotSource,
     redshift: RedshiftClient,
-    published: PublishedSnapshot,
+    published: PublishedDelivery,
     *,
     workgroup: str,
     database: str,
@@ -294,16 +271,11 @@ def _stage_snapshot(
     )
 
 
-def _read_object(s3: SnapshotSource, bucket: str, key: str) -> bytes:
-    with closing(s3.get_object(Bucket=bucket, Key=key)["Body"]) as body:
-        return body.read()
-
-
 def _verify_copy_manifest(
     s3: SnapshotSource, bucket: str, key: str, expected_urls: set[str]
 ) -> None:
     try:
-        manifest: object = json.loads(_read_object(s3, bucket, key).decode("utf-8"))
+        manifest: object = json.loads(read_s3_object(s3, bucket, key).decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise SnapshotStagingError(f"Invalid COPY manifest: {key}") from exc
     if not isinstance(manifest, dict) or not isinstance(manifest.get("entries"), list):

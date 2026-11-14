@@ -1,4 +1,4 @@
-"""Validate one historical v1 delivery and return its verified file list."""
+"""Read delivery manifests and verify local historical snapshot files."""
 
 import json
 import ntpath
@@ -11,6 +11,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 _VERSION_COLUMNS = (("updated_at", "timestamp"), ("source_sequence", "int64"))
+BATCH_ID_PATTERN = r"[a-z0-9][a-z0-9_-]*"
 SNAPSHOT_LAYOUTS = {
     "customers": (
         ("customer_id", "string"),
@@ -79,19 +80,21 @@ class SnapshotManifest:
 
 
 @dataclass(frozen=True)
-class SnapshotFileEntry:
+class BatchFileEntry:
     relative_path: str
     entity_type: str
     row_count: int
     sha256: str
+    schema_version: int
 
 
 @dataclass(frozen=True)
-class SnapshotDelivery:
+class BatchDelivery:
     dataset_id: str
     batch_id: str
+    kind: str
     arrival_date: date
-    files: tuple[SnapshotFileEntry, ...]
+    files: tuple[BatchFileEntry, ...]
 
 
 def validate_snapshot_manifest(path: Path) -> SnapshotManifest:
@@ -137,8 +140,13 @@ def validate_snapshot_manifest(path: Path) -> SnapshotManifest:
     )
 
 
-def parse_snapshot_manifest(raw: bytes) -> SnapshotDelivery:
+def parse_snapshot_manifest(raw: bytes) -> BatchDelivery:
     """Validate historical v1 manifest metadata independently of file storage."""
+    return parse_batch_manifest(raw, historical_only=True)
+
+
+def parse_batch_manifest(raw: bytes, *, historical_only: bool = False) -> BatchDelivery:
+    """Validate published manifest metadata for a historical or incremental batch."""
     try:
         manifest: object = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -148,12 +156,13 @@ def parse_snapshot_manifest(raw: bytes) -> SnapshotDelivery:
     dataset_id = manifest.get("dataset_id")
     batch_id = manifest.get("batch_id")
     for field, value in (("dataset_id", dataset_id), ("batch_id", batch_id)):
-        if not isinstance(value, str) or not re.fullmatch(
-            r"[a-z0-9][a-z0-9_-]*", value
-        ):
+        if not isinstance(value, str) or not re.fullmatch(BATCH_ID_PATTERN, value):
             raise ManifestValidationError(f"Invalid {field}: {value!r}")
-    if manifest.get("kind") != "historical":
+    kind = manifest.get("kind")
+    if historical_only and kind != "historical":
         raise ManifestValidationError("Expected a historical snapshot manifest")
+    if kind not in ("historical", "incremental"):
+        raise ManifestValidationError(f"Invalid kind: {kind!r}")
     arrival = manifest.get("arrival_date")
     if not isinstance(arrival, str) or not re.fullmatch(
         r"[0-9]{4}-[0-9]{2}-[0-9]{2}", arrival
@@ -169,19 +178,29 @@ def parse_snapshot_manifest(raw: bytes) -> SnapshotDelivery:
     entries = manifest.get("files")
     if not isinstance(entries, list) or not entries:
         raise ManifestValidationError("files must be a non-empty array")
-    files = tuple(_parse_file(entry) for entry in entries)
+    files = tuple(_parse_file(entry, kind=str(kind)) for entry in entries)
     if len({file.relative_path for file in files}) != len(files):
         raise ManifestValidationError("Duplicate file path in manifest")
 
-    missing = SNAPSHOT_LAYOUTS.keys() - {file.entity_type for file in files}
-    if missing:
-        raise ManifestValidationError(
-            f"Missing snapshot entities: {', '.join(sorted(missing))}"
-        )
-    return SnapshotDelivery(str(dataset_id), str(batch_id), arrival_date, files)
+    versions: dict[str, int] = {}
+    for file in files:
+        if (
+            versions.setdefault(file.entity_type, file.schema_version)
+            != file.schema_version
+        ):
+            raise ManifestValidationError(
+                f"Mixed schema versions for {file.entity_type}"
+            )
+    if kind == "historical":
+        missing = SNAPSHOT_LAYOUTS.keys() - versions.keys()
+        if missing:
+            raise ManifestValidationError(
+                f"Missing snapshot entities: {', '.join(sorted(missing))}"
+            )
+    return BatchDelivery(str(dataset_id), str(batch_id), str(kind), arrival_date, files)
 
 
-def _parse_file(entry: object) -> SnapshotFileEntry:
+def _parse_file(entry: object, *, kind: str) -> BatchFileEntry:
     if not isinstance(entry, dict):
         raise ManifestValidationError("Each files entry must be a JSON object")
     relative = entry.get("path")
@@ -200,9 +219,13 @@ def _parse_file(entry: object) -> SnapshotFileEntry:
     if not isinstance(entity, str) or entity not in SNAPSHOT_LAYOUTS:
         raise ManifestValidationError(f"{relative}: unknown entity_type {entity!r}")
     version = entry.get("schema_version")
-    if type(version) is not int or version != 1:
+    allowed_versions = (
+        (1, 2) if kind == "incremental" and entity == "order_items" else (1,)
+    )
+    if type(version) is not int or version not in allowed_versions:
+        label = "snapshot" if kind == "historical" else "incremental"
         raise ManifestValidationError(
-            f"{relative}: unsupported snapshot schema version {version!r}"
+            f"{relative}: unsupported {label} schema version {version!r}"
         )
     row_count = entry.get("row_count")
     if type(row_count) is not int or row_count <= 0:
@@ -212,7 +235,7 @@ def _parse_file(entry: object) -> SnapshotFileEntry:
     checksum = entry.get("sha256")
     if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
         raise ManifestValidationError(f"{relative}: invalid SHA-256 digest")
-    return SnapshotFileEntry(relative, entity, row_count, checksum)
+    return BatchFileEntry(relative, entity, row_count, checksum, version)
 
 
 def _validate_parquet(file: SnapshotFile) -> None:

@@ -1,20 +1,28 @@
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter
 from contextlib import closing
 from dataclasses import asdict, dataclass
+from datetime import date
 from pathlib import Path
 from typing import cast
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
+from retail_pipeline.discovery import (
+    DeliverySelectionError,
+    DeliverySource,
+    SnapshotSource,
+    discover_deliveries,
+    read_published_delivery,
+)
 from retail_pipeline.manifest import ManifestValidationError, validate_snapshot_manifest
 from retail_pipeline.staging import (
     RedshiftClient,
-    SnapshotSource,
     SnapshotStagingError,
     load_snapshot,
     stage_snapshot,
@@ -47,7 +55,7 @@ def parse_settings(argv: list[str] | None = None) -> PipelineSettings:
     parser = argparse.ArgumentParser(
         description="Display the pipeline configuration without connecting to AWS.",
         epilog="Commands: validate-manifest, upload-snapshot, stage-snapshot, "
-        "load-snapshot, run-snapshot.",
+        "load-snapshot, run-snapshot, discover-deliveries.",
     )
     options = (
         ("--dataset-path", "RETAIL_DATASET_PATH", "Local dataset directory"),
@@ -101,6 +109,9 @@ def main() -> None:
         return
     if arguments[:1] == ["run-snapshot"]:
         _run_snapshot_command(arguments[1:])
+        return
+    if arguments[:1] == ["discover-deliveries"]:
+        _discover_deliveries_command(arguments[1:])
         return
 
     settings = parse_settings(arguments)
@@ -237,3 +248,73 @@ def _run_snapshot_command(arguments: list[str]) -> None:
     from retail_pipeline.flows import run_snapshot
 
     run_snapshot(args.source_manifest_uri)
+
+
+def _parse_cutoff(value: str) -> date:
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"Invalid UTC cutoff date: {value}"
+            ) from exc
+    raise argparse.ArgumentTypeError("Cutoff must be a UTC date in YYYY-MM-DD form")
+
+
+def _discover_deliveries_command(arguments: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="retail-pipeline discover-deliveries",
+        description="Read one published manifest or list normal deliveries in order.",
+    )
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("source_manifest_uri", nargs="?")
+    selection.add_argument("--through", type=_parse_cutoff, metavar="YYYY-MM-DD")
+    parser.add_argument(
+        "--dataset-id", help="Dataset release to discover with --through"
+    )
+    _add_options(parser, _S3_OPTIONS[:2])
+    parser.add_argument("--raw-bucket", default=os.environ.get("RETAIL_RAW_BUCKET"))
+    args = parser.parse_args(arguments)
+    if args.through and (not args.dataset_id or not args.raw_bucket):
+        parser.error("--through requires --dataset-id and a raw bucket")
+    if args.source_manifest_uri and args.dataset_id:
+        parser.error("--dataset-id is only used with --through")
+
+    try:
+        session = boto3.Session(
+            profile_name=args.aws_profile, region_name=args.aws_region
+        )
+        with closing(session.client("s3")) as client:
+            source = cast(DeliverySource, client)
+            if args.source_manifest_uri:
+                deliveries = [read_published_delivery(source, args.source_manifest_uri)]
+            else:
+                deliveries = discover_deliveries(
+                    source,
+                    bucket=args.raw_bucket,
+                    dataset_id=args.dataset_id,
+                    cutoff=args.through,
+                )
+    except (
+        DeliverySelectionError,
+        ManifestValidationError,
+        ClientError,
+        BotoCoreError,
+    ) as exc:
+        parser.exit(1, f"{parser.prog}: {exc}\n")
+
+    print(
+        json.dumps(
+            [
+                {
+                    "source_manifest_uri": published.source_manifest_uri,
+                    "dataset_id": published.delivery.dataset_id,
+                    "batch_id": published.delivery.batch_id,
+                    "kind": published.delivery.kind,
+                    "arrival_date": published.delivery.arrival_date.isoformat(),
+                }
+                for published in deliveries
+            ],
+            indent=2,
+        )
+    )

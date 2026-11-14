@@ -10,11 +10,10 @@ from typing import cast
 import boto3
 from prefect import flow, get_run_logger, task
 
+from retail_pipeline.discovery import PublishedDelivery, SnapshotSource
 from retail_pipeline.staging import (
     LoadedSnapshot,
-    PublishedSnapshot,
     RedshiftClient,
-    SnapshotSource,
     StagedSnapshotLoad,
     commit_snapshot_load,
     read_published_snapshot,
@@ -23,7 +22,7 @@ from retail_pipeline.staging import (
 
 
 @task(name="read-published-manifest", persist_result=False)
-def _read_manifest(s3: SnapshotSource, source_manifest_uri: str) -> PublishedSnapshot:
+def _read_manifest(s3: SnapshotSource, source_manifest_uri: str) -> PublishedDelivery:
     published = read_published_snapshot(s3, source_manifest_uri)
     get_run_logger().info(
         "Read dataset %s, batch %s from %s",
@@ -38,7 +37,7 @@ def _read_manifest(s3: SnapshotSource, source_manifest_uri: str) -> PublishedSna
 def _stage(
     s3: SnapshotSource,
     redshift: RedshiftClient,
-    published: PublishedSnapshot,
+    published: PublishedDelivery,
     *,
     workgroup: str,
     database: str,
