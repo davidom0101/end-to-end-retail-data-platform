@@ -1,0 +1,20 @@
+version: 2
+
+sources:
+  - name: core
+    schema: "{{ var('core_schema', 'core_demo') }}"
+    tables:
+      - name: orders
+      - name: order_items
+
+models:
+  - name: mart_daily_sales
+    description: Net sales in EUR by UTC order date for paid, shipped, and delivered orders.
+    columns:
+      - name: order_date
+        description: UTC calendar date the order was placed.
+        data_tests:
+          - unique
+          - not_null
+      - name: net_sales
+        description: Sum of item prices times quantity, less item discounts, in EUR.
