@@ -11,7 +11,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 _VERSION_COLUMNS = (("updated_at", "timestamp"), ("source_sequence", "int64"))
-_SNAPSHOT_LAYOUTS = {
+SNAPSHOT_LAYOUTS = {
     "customers": (
         ("customer_id", "string"),
         ("created_at", "timestamp"),
@@ -78,15 +78,71 @@ class SnapshotManifest:
     files: tuple[SnapshotFile, ...]
 
 
+@dataclass(frozen=True)
+class SnapshotFileEntry:
+    relative_path: str
+    entity_type: str
+    row_count: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class SnapshotDelivery:
+    dataset_id: str
+    batch_id: str
+    arrival_date: date
+    files: tuple[SnapshotFileEntry, ...]
+
+
 def validate_snapshot_manifest(path: Path) -> SnapshotManifest:
     """Read the manifest and verify every listed file without contacting AWS."""
     try:
         path = path.expanduser().resolve()
         raw = path.read_bytes()
-        manifest: object = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except OSError as exc:
         raise ManifestValidationError(f"Cannot read manifest {path}: {exc}") from exc
+    delivery = parse_snapshot_manifest(raw)
+    files = []
+    seen_paths: set[Path] = set()
+    for entry in delivery.files:
+        try:
+            file_path = (path.parent / entry.relative_path).resolve()
+        except OSError as exc:
+            raise ManifestValidationError(
+                f"Cannot resolve {entry.relative_path}: {exc}"
+            ) from exc
+        if not file_path.is_relative_to(path.parent):
+            raise ManifestValidationError(
+                f"Parquet path leaves manifest directory: {entry.relative_path}"
+            )
+        if file_path in seen_paths:
+            raise ManifestValidationError(f"Duplicate file path: {entry.relative_path}")
+        seen_paths.add(file_path)
+        file = SnapshotFile(
+            file_path,
+            entry.relative_path,
+            entry.entity_type,
+            entry.row_count,
+            entry.sha256,
+        )
+        _validate_parquet(file)
+        files.append(file)
+    return SnapshotManifest(
+        path,
+        delivery.dataset_id,
+        delivery.batch_id,
+        delivery.arrival_date,
+        sha256(raw).hexdigest(),
+        tuple(files),
+    )
 
+
+def parse_snapshot_manifest(raw: bytes) -> SnapshotDelivery:
+    """Validate historical v1 manifest metadata independently of file storage."""
+    try:
+        manifest: object = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ManifestValidationError(f"Invalid manifest JSON: {exc}") from exc
     if not isinstance(manifest, dict):
         raise ManifestValidationError("Manifest must be a JSON object")
     dataset_id = manifest.get("dataset_id")
@@ -113,33 +169,19 @@ def validate_snapshot_manifest(path: Path) -> SnapshotManifest:
     entries = manifest.get("files")
     if not isinstance(entries, list) or not entries:
         raise ManifestValidationError("files must be a non-empty array")
-    files: list[SnapshotFile] = []
-    seen_paths: set[Path] = set()
-    for entry in entries:
-        file = _parse_file(entry, path.parent)
-        if file.path in seen_paths:
-            raise ManifestValidationError(f"Duplicate file path: {file.relative_path}")
-        seen_paths.add(file.path)
-        files.append(file)
+    files = tuple(_parse_file(entry) for entry in entries)
+    if len({file.relative_path for file in files}) != len(files):
+        raise ManifestValidationError("Duplicate file path in manifest")
 
-    missing = _SNAPSHOT_LAYOUTS.keys() - {file.entity_type for file in files}
+    missing = SNAPSHOT_LAYOUTS.keys() - {file.entity_type for file in files}
     if missing:
         raise ManifestValidationError(
             f"Missing snapshot entities: {', '.join(sorted(missing))}"
         )
-    for file in files:
-        _validate_parquet(file)
-    return SnapshotManifest(
-        path,
-        str(dataset_id),
-        str(batch_id),
-        arrival_date,
-        sha256(raw).hexdigest(),
-        tuple(files),
-    )
+    return SnapshotDelivery(str(dataset_id), str(batch_id), arrival_date, files)
 
 
-def _parse_file(entry: object, directory: Path) -> SnapshotFile:
+def _parse_file(entry: object) -> SnapshotFileEntry:
     if not isinstance(entry, dict):
         raise ManifestValidationError("Each files entry must be a JSON object")
     relative = entry.get("path")
@@ -154,17 +196,8 @@ def _parse_file(entry: object, directory: Path) -> SnapshotFile:
         )
     ):
         raise ManifestValidationError(f"Unsafe Parquet path: {relative!r}")
-    try:
-        path = (directory / relative).resolve()
-    except OSError as exc:
-        raise ManifestValidationError(f"Cannot resolve {relative}: {exc}") from exc
-    if not path.is_relative_to(directory):
-        raise ManifestValidationError(
-            f"Parquet path leaves manifest directory: {relative}"
-        )
-
     entity = entry.get("entity_type")
-    if not isinstance(entity, str) or entity not in _SNAPSHOT_LAYOUTS:
+    if not isinstance(entity, str) or entity not in SNAPSHOT_LAYOUTS:
         raise ManifestValidationError(f"{relative}: unknown entity_type {entity!r}")
     version = entry.get("schema_version")
     if type(version) is not int or version != 1:
@@ -179,7 +212,7 @@ def _parse_file(entry: object, directory: Path) -> SnapshotFile:
     checksum = entry.get("sha256")
     if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
         raise ManifestValidationError(f"{relative}: invalid SHA-256 digest")
-    return SnapshotFile(path, relative, entity, row_count, checksum)
+    return SnapshotFileEntry(relative, entity, row_count, checksum)
 
 
 def _validate_parquet(file: SnapshotFile) -> None:
@@ -205,7 +238,7 @@ def _validate_parquet(file: SnapshotFile) -> None:
 
 def _validate_layout(file: SnapshotFile, parquet: pq.ParquetFile) -> None:
     schema = parquet.schema
-    layout = _SNAPSHOT_LAYOUTS[file.entity_type]
+    layout = SNAPSHOT_LAYOUTS[file.entity_type]
     if schema.names != [name for name, _ in layout]:
         raise ManifestValidationError(
             f"{file.relative_path}: unexpected Parquet columns or order"
