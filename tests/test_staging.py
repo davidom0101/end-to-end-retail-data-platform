@@ -1,8 +1,15 @@
 import json
+from collections.abc import Iterator
 from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+from prefect.testing.utilities import prefect_test_harness
 
+from retail_pipeline import flows
+from retail_pipeline.cli import main
 from retail_pipeline.staging import SnapshotStagingError, load_snapshot, stage_snapshot
 
 BUCKET = "retail-raw"
@@ -196,3 +203,75 @@ def test_core_load_rejects_target_outside_demo_namespace() -> None:
             core_schema="core",
         )
     assert not redshift.statements
+
+
+@pytest.fixture(scope="module")
+def prefect_server() -> Iterator[None]:
+    with prefect_test_harness():
+        yield
+
+
+@pytest.mark.usefixtures("prefect_server")
+@pytest.mark.parametrize("failure", [None, "stage", "dbt"])
+def test_run_snapshot_cli_runs_dbt_only_after_verified_core_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str | None
+) -> None:
+    # The runner checkout only needs the dbt project. The publisher owns local data.
+    project_dir = tmp_path / "dbt"
+    project_dir.mkdir()
+    (project_dir / "dbt_project.yml").touch()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("RETAIL_DATASET_PATH", str(tmp_path / "missing-dataset"))
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-west-1")
+    monkeypatch.setenv("RETAIL_REDSHIFT_WORKGROUP", "retail-dev")
+    monkeypatch.setenv("RETAIL_REDSHIFT_DATABASE", "retail")
+    monkeypatch.setenv("RETAIL_CORE_SCHEMA", "core_demo_flow")
+    monkeypatch.setattr("sys.argv", ["retail-pipeline", "run-snapshot", SOURCE_URI])
+
+    s3 = PublishedObjects()
+    counts = {**COUNTS, "orders": 4899} if failure == "stage" else COUNTS
+    redshift = RedshiftBatch(counts)
+    monkeypatch.setattr(s3, "close", lambda: None, raising=False)
+    monkeypatch.setattr(redshift, "close", lambda: None, raising=False)
+    clients = {"s3": s3, "redshift-data": redshift}
+    monkeypatch.setattr(
+        flows.boto3, "Session", lambda **_: SimpleNamespace(client=clients.__getitem__)
+    )
+
+    process = MagicMock()
+    process.__enter__.return_value = process
+    process.stdout = ["dbt build complete\n"]
+    process.wait.return_value = 1 if failure == "dbt" else 0
+
+    def start_dbt(command: list[str], **kwargs: object) -> MagicMock:
+        assert redshift.core_statements[1] == "DELETE FROM core_demo_flow.order_items"
+        assert command[:5] == [
+            "dbt",
+            "--no-use-colors",
+            "build",
+            "--project-dir",
+            str(project_dir),
+        ]
+        assert command[5] == "--vars"
+        assert json.loads(command[6]) == {"core_schema": "core_demo_flow"}
+        return process
+
+    # Leave subprocess handling for Prefect itself untouched.
+    fake_subprocess = SimpleNamespace(
+        Popen=MagicMock(side_effect=start_dbt), PIPE=-1, STDOUT=-2
+    )
+    monkeypatch.setattr(flows, "subprocess", fake_subprocess)
+
+    if failure == "stage":
+        with pytest.raises(SnapshotStagingError, match="Staged row counts differ"):
+            main()
+        assert redshift.core_statements == []
+        fake_subprocess.Popen.assert_not_called()
+    elif failure == "dbt":
+        with pytest.raises(RuntimeError, match="dbt build failed with exit code 1"):
+            main()
+        fake_subprocess.Popen.assert_called_once()
+    else:
+        main()
+        fake_subprocess.Popen.assert_called_once()

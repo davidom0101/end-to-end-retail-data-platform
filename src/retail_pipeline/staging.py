@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from time import monotonic, sleep
 from typing import BinaryIO, Protocol, TypedDict
 
-from retail_pipeline.manifest import SNAPSHOT_LAYOUTS, parse_snapshot_manifest
+from retail_pipeline.manifest import (
+    SNAPSHOT_LAYOUTS,
+    SnapshotDelivery,
+    parse_snapshot_manifest,
+)
 
 _REDSHIFT_TYPES = {
     "string": "VARCHAR(65535)",
@@ -66,9 +70,24 @@ class SnapshotStagingError(ValueError):
 
 
 @dataclass(frozen=True)
+class PublishedSnapshot:
+    source_manifest_uri: str
+    bucket: str
+    prefix: str
+    delivery: SnapshotDelivery
+
+
+@dataclass(frozen=True)
 class StagedSnapshot:
     source_manifest_uri: str
     row_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class StagedSnapshotLoad:
+    snapshot: StagedSnapshot
+    core_schema: str
+    session_id: str
 
 
 @dataclass(frozen=True)
@@ -76,6 +95,23 @@ class LoadedSnapshot:
     source_manifest_uri: str
     core_schema: str
     row_counts: dict[str, int]
+
+
+def read_published_snapshot(
+    s3: SnapshotSource, source_manifest_uri: str
+) -> PublishedSnapshot:
+    """Read the historical manifest and check that its IDs match the S3 key."""
+    location = _SOURCE_URI.fullmatch(source_manifest_uri)
+    if location is None:
+        raise SnapshotStagingError(
+            "Expected s3://<bucket>/raw/<dataset-id>/<batch-id>/manifest.json"
+        )
+    bucket, prefix = location.groups()
+    source_bytes = _read_object(s3, bucket, f"{prefix}/manifest.json")
+    delivery = parse_snapshot_manifest(source_bytes)
+    if prefix != f"raw/{delivery.dataset_id}/{delivery.batch_id}":
+        raise SnapshotStagingError("Manifest IDs do not match its S3 key")
+    return PublishedSnapshot(source_manifest_uri, bucket, prefix, delivery)
 
 
 def stage_snapshot(
@@ -90,7 +126,7 @@ def stage_snapshot(
     staged, _ = _stage_snapshot(
         s3,
         redshift,
-        source_manifest_uri,
+        read_published_snapshot(s3, source_manifest_uri),
         workgroup=workgroup,
         database=database,
         core_schema="core",
@@ -109,14 +145,33 @@ def load_snapshot(
     core_schema: str,
 ) -> LoadedSnapshot:
     """Replace the four tables in the explicitly selected demo schema atomically."""
-    if not re.fullmatch(r"core_demo(?:_[a-z0-9_]{1,117})?", core_schema):
-        raise SnapshotStagingError(
-            "Target schema must be core_demo or core_demo_<name>"
-        )
+    _validate_core_schema(core_schema)
+    staged = stage_snapshot_for_load(
+        s3,
+        redshift,
+        read_published_snapshot(s3, source_manifest_uri),
+        workgroup=workgroup,
+        database=database,
+        core_schema=core_schema,
+    )
+    return commit_snapshot_load(redshift, staged)
+
+
+def stage_snapshot_for_load(
+    s3: SnapshotSource,
+    redshift: RedshiftClient,
+    published: PublishedSnapshot,
+    *,
+    workgroup: str,
+    database: str,
+    core_schema: str,
+) -> StagedSnapshotLoad:
+    """Verify staging counts and keep the session open for the core transaction."""
+    _validate_core_schema(core_schema)
     staged, session_id = _stage_snapshot(
         s3,
         redshift,
-        source_manifest_uri,
+        published,
         workgroup=workgroup,
         database=database,
         core_schema=core_schema,
@@ -124,7 +179,15 @@ def load_snapshot(
     )
     if not session_id:
         raise SnapshotStagingError("Redshift did not return the staging session ID")
+    return StagedSnapshotLoad(staged, core_schema, session_id)
 
+
+def commit_snapshot_load(
+    redshift: RedshiftClient, staged: StagedSnapshotLoad
+) -> LoadedSnapshot:
+    """Replace the demo tables using the verified rows in the staging session."""
+    core_schema = staged.core_schema
+    _validate_core_schema(core_schema)
     tables = [f"{core_schema}.{entity}" for entity in SNAPSHOT_LAYOUTS]
     # Acquire all write locks before the transaction takes its data snapshot.
     statements = [f"LOCK TABLE {', '.join(tables)}"]
@@ -143,36 +206,35 @@ def load_snapshot(
             f"SELECT {', '.join(values)} FROM stage_{entity}"
         )
     batch = redshift.batch_execute_statement(
-        Sqls=statements, SessionId=session_id, SessionKeepAliveSeconds=0
+        Sqls=statements, SessionId=staged.session_id, SessionKeepAliveSeconds=0
     )
     _wait_for_statement(redshift, batch["Id"])
-    return LoadedSnapshot(source_manifest_uri, core_schema, staged.row_counts)
+    return LoadedSnapshot(
+        staged.snapshot.source_manifest_uri, core_schema, staged.snapshot.row_counts
+    )
+
+
+def _validate_core_schema(core_schema: str) -> None:
+    if not re.fullmatch(r"core_demo(?:_[a-z0-9_]{1,117})?", core_schema):
+        raise SnapshotStagingError(
+            "Target schema must be core_demo or core_demo_<name>"
+        )
 
 
 def _stage_snapshot(
     s3: SnapshotSource,
     redshift: RedshiftClient,
-    source_manifest_uri: str,
+    published: PublishedSnapshot,
     *,
     workgroup: str,
     database: str,
     core_schema: str,
     keep_alive: int,
 ) -> tuple[StagedSnapshot, str | None]:
-    location = _SOURCE_URI.fullmatch(source_manifest_uri)
-    if location is None:
-        raise SnapshotStagingError(
-            "Expected s3://<bucket>/raw/<dataset-id>/<batch-id>/manifest.json"
-        )
-    bucket, prefix = location.groups()
-    source_bytes = _read_object(s3, bucket, f"{prefix}/manifest.json")
-    delivery = parse_snapshot_manifest(source_bytes)
-    if prefix != f"raw/{delivery.dataset_id}/{delivery.batch_id}":
-        raise SnapshotStagingError("Manifest IDs do not match its S3 key")
-
+    bucket, prefix = published.bucket, published.prefix
     expected_counts: Counter[str] = Counter()
     expected_urls: dict[str, set[str]] = {entity: set() for entity in SNAPSHOT_LAYOUTS}
-    for entry in delivery.files:
+    for entry in published.delivery.files:
         expected_counts[entry.entity_type] += entry.row_count
         expected_urls[entry.entity_type].add(
             f"s3://{bucket}/{prefix}/{entry.relative_path}"
@@ -227,7 +289,9 @@ def _stage_snapshot(
             f"Staged row counts differ from the source manifest. "
             f"Expected {dict(expected_counts)}, got {actual_counts}"
         )
-    return StagedSnapshot(source_manifest_uri, actual_counts), batch.get("SessionId")
+    return StagedSnapshot(published.source_manifest_uri, actual_counts), batch.get(
+        "SessionId"
+    )
 
 
 def _read_object(s3: SnapshotSource, bucket: str, key: str) -> bytes:

@@ -47,7 +47,7 @@ def parse_settings(argv: list[str] | None = None) -> PipelineSettings:
     parser = argparse.ArgumentParser(
         description="Display the pipeline configuration without connecting to AWS.",
         epilog="Commands: validate-manifest, upload-snapshot, stage-snapshot, "
-        "load-snapshot.",
+        "load-snapshot, run-snapshot.",
     )
     options = (
         ("--dataset-path", "RETAIL_DATASET_PATH", "Local dataset directory"),
@@ -98,6 +98,9 @@ def main() -> None:
         return
     if arguments[:1] == ["load-snapshot"]:
         _stage_snapshot_command(arguments[1:], load_core=True)
+        return
+    if arguments[:1] == ["run-snapshot"]:
+        _run_snapshot_command(arguments[1:])
         return
 
     settings = parse_settings(arguments)
@@ -221,3 +224,16 @@ def _stage_snapshot_command(arguments: list[str], *, load_core: bool = False) ->
     ) as exc:
         parser.exit(1, f"{parser.prog}: {exc}\n")
     print(json.dumps(result, indent=2))
+
+
+def _run_snapshot_command(arguments: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="retail-pipeline run-snapshot",
+        description="Run the Prefect flow for a published S3 snapshot manifest.",
+    )
+    parser.add_argument("source_manifest_uri")
+    args = parser.parse_args(arguments)
+
+    from retail_pipeline.flows import run_snapshot
+
+    run_snapshot(args.source_manifest_uri)
