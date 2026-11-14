@@ -10,7 +10,13 @@ from prefect.testing.utilities import prefect_test_harness
 
 from retail_pipeline import flows
 from retail_pipeline.cli import main
-from retail_pipeline.staging import SnapshotStagingError, load_snapshot, stage_snapshot
+from retail_pipeline.discovery import read_published_delivery
+from retail_pipeline.staging import (
+    SnapshotStagingError,
+    load_snapshot,
+    stage_incremental,
+    stage_snapshot,
+)
 
 BUCKET = "retail-raw"
 PREFIX = "raw/demo-v1/snapshot-001"
@@ -19,10 +25,13 @@ COUNTS = {"customers": 800, "products": 50, "orders": 4900, "order_items": 8747}
 
 
 class PublishedObjects:
-    def __init__(self) -> None:
+    def __init__(self, *, incremental: bool = False) -> None:
         files = []
         self.objects = {}
-        for entity, count in COUNTS.items():
+        batch_id = "daily-001" if incremental else "snapshot-001"
+        prefix = f"raw/demo-v1/{batch_id}"
+        counts = {"orders": 1} if incremental else COUNTS
+        for entity, count in counts.items():
             path = f"{entity}/part-001.parquet"
             files.append(
                 {
@@ -33,19 +42,19 @@ class PublishedObjects:
                     "sha256": "a" * 64,
                 }
             )
-            self.objects[f"{PREFIX}/copy/{entity}.json"] = {
+            self.objects[f"{prefix}/copy/{entity}.json"] = {
                 "entries": [
                     {
-                        "url": f"s3://{BUCKET}/{PREFIX}/{path}",
+                        "url": f"s3://{BUCKET}/{prefix}/{path}",
                         "mandatory": True,
                         "meta": {"content_length": 10},
                     }
                 ]
             }
-        self.objects[f"{PREFIX}/manifest.json"] = {
+        self.objects[f"{prefix}/manifest.json"] = {
             "dataset_id": "demo-v1",
-            "batch_id": "snapshot-001",
-            "kind": "historical",
+            "batch_id": batch_id,
+            "kind": "incremental" if incremental else "historical",
             "arrival_date": "2026-11-10",
             "files": files,
         }
@@ -56,8 +65,11 @@ class PublishedObjects:
 
 
 class RedshiftBatch:
-    def __init__(self, counts: dict[str, int]) -> None:
+    def __init__(
+        self, counts: dict[str, int], *, invalid_ids: int | None = None
+    ) -> None:
         self.counts = counts
+        self.invalid_ids = invalid_ids
         self.statements: list[str] = []
         self.core_statements: list[str] = []
 
@@ -87,9 +99,10 @@ class RedshiftBatch:
 
     def get_statement_result(self, *, Id: str) -> dict:
         assert Id == "batch-id:13"
+        invalid = [] if self.invalid_ids is None else [{"longValue": self.invalid_ids}]
         return {
             "Records": [
-                [{"stringValue": entity}, {"longValue": count}]
+                [{"stringValue": entity}, {"longValue": count}, *invalid]
                 for entity, count in self.counts.items()
             ]
         }
@@ -148,6 +161,43 @@ def test_reports_row_count_mismatch() -> None:
             workgroup="retail-dev",
             database="retail",
         )
+
+
+@pytest.mark.parametrize(
+    ("count", "invalid_ids", "error"),
+    [
+        (1, 0, None),
+        (0, 0, "Staged row counts differ"),
+        (1, 1, "Invalid event entity_type or record_id"),
+    ],
+)
+def test_incremental_staging_checks_row_counts_and_event_identity(
+    count: int, invalid_ids: int, error: str | None
+) -> None:
+    s3 = PublishedObjects(incremental=True)
+    batch = RedshiftBatch({"orders": count}, invalid_ids=invalid_ids)
+    prefix = "raw/demo-v1/daily-001"
+    published = read_published_delivery(s3, f"s3://{BUCKET}/{prefix}/manifest.json")
+
+    if error:
+        with pytest.raises(SnapshotStagingError, match=error):
+            stage_incremental(
+                s3, batch, published, workgroup="retail-dev", database="retail"
+            )
+    else:
+        assert stage_incremental(
+            s3, batch, published, workgroup="retail-dev", database="retail"
+        ) == {"orders": 1}
+
+    create_table, copy, audit = batch.statements
+    assert create_table.startswith("CREATE TEMP TABLE stage_orders (event_id ")
+    assert "arrival_at TIMESTAMP, order_id VARCHAR" in create_table
+    assert (
+        copy == f"COPY stage_orders FROM 's3://{BUCKET}/{prefix}/copy/orders.json' "
+        "IAM_ROLE default FORMAT AS PARQUET MANIFEST"
+    )
+    assert "entity_type <> 'orders'" in audit and "record_id <> order_id" in audit
+    assert batch.core_statements == []
 
 
 def test_core_load_uses_verified_session_and_replaces_only_demo_tables() -> None:

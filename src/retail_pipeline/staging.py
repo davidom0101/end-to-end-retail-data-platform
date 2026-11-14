@@ -1,4 +1,4 @@
-"""Stage and load published historical snapshots from S3."""
+"""Stage published deliveries and load historical snapshots from S3."""
 
 import json
 import re
@@ -14,7 +14,7 @@ from retail_pipeline.discovery import (
     read_published_delivery,
     read_s3_object,
 )
-from retail_pipeline.manifest import SNAPSHOT_LAYOUTS
+from retail_pipeline.manifest import SNAPSHOT_LAYOUTS, v1_layouts
 
 _REDSHIFT_TYPES = {
     "string": "VARCHAR(65535)",
@@ -108,6 +108,47 @@ def stage_snapshot(
         keep_alive=0,
     )
     return staged
+
+
+def stage_incremental(
+    s3: SnapshotSource,
+    redshift: RedshiftClient,
+    published: PublishedDelivery,
+    *,
+    workgroup: str,
+    database: str,
+) -> dict[str, int]:
+    """Verify one incremental v1 delivery in session-local staging tables."""
+    if published.delivery.kind != "incremental":
+        raise SnapshotStagingError("Expected an incremental delivery manifest")
+    layouts = v1_layouts(published.delivery)
+    statements, expected_counts = _copy_batch(s3, published, layouts)
+    count_queries = []
+    for entity in expected_counts:
+        business_key = SNAPSHOT_LAYOUTS[entity][0][0]
+        # Redshift text comparisons ignore trailing spaces. Compare byte lengths too.
+        count_queries.append(
+            f"SELECT '{entity}' AS entity, COUNT(*) AS row_count, "
+            "COUNT(CASE WHEN entity_type IS NULL OR record_id IS NULL "
+            f"OR {business_key} IS NULL OR entity_type <> '{entity}' "
+            f"OR OCTET_LENGTH(entity_type) <> {len(entity)} "
+            f"OR record_id <> {business_key} "
+            f"OR OCTET_LENGTH(record_id) <> OCTET_LENGTH({business_key}) "
+            f"THEN 1 END) AS invalid_ids FROM stage_{entity}"
+        )
+    statements.append(" UNION ALL ".join(count_queries))
+    rows, _ = _run_staging_batch(
+        redshift, statements, workgroup=workgroup, database=database, keep_alive=0
+    )
+    actual_counts = _check_row_counts(rows, expected_counts)
+    invalid = {
+        str(entity["stringValue"]): count["longValue"]
+        for entity, _, count in rows
+        if count["longValue"] != 0
+    }
+    if invalid:
+        raise SnapshotStagingError(f"Invalid event entity_type or record_id: {invalid}")
+    return actual_counts
 
 
 def load_snapshot(
@@ -208,42 +249,76 @@ def _stage_snapshot(
     core_schema: str,
     keep_alive: int,
 ) -> tuple[StagedSnapshot, str | None]:
-    bucket, prefix = published.bucket, published.prefix
-    expected_counts: Counter[str] = Counter()
-    expected_urls: dict[str, set[str]] = {entity: set() for entity in SNAPSHOT_LAYOUTS}
-    for entry in published.delivery.files:
-        expected_counts[entry.entity_type] += entry.row_count
-        expected_urls[entry.entity_type].add(
-            f"s3://{bucket}/{prefix}/{entry.relative_path}"
-        )
-
+    copy_statements, expected_counts = _copy_batch(s3, published, SNAPSHOT_LAYOUTS)
     statements = [f"CREATE SCHEMA IF NOT EXISTS {core_schema}"]
     count_queries = []
     for entity, columns in SNAPSHOT_LAYOUTS.items():
-        copy_key = f"{prefix}/copy/{entity}.json"
-        _verify_copy_manifest(s3, bucket, copy_key, expected_urls[entity])
-        staging_columns = ", ".join(
-            f"{name} {_REDSHIFT_TYPES[kind]}" for name, kind in columns
-        )
-        core_columns = staging_columns
+        core_columns = _sql_columns(columns)
         if entity == "customers":
             core_columns += ", updated_at TIMESTAMP, source_sequence BIGINT"
         if entity == "order_items":
             core_columns += ", discount_amount DECIMAL(12,2)"
-        # Temporary staging keeps retries and concurrent checks isolated.
-        statements.extend(
-            [
-                f"CREATE TABLE IF NOT EXISTS {core_schema}.{entity} ({core_columns})",
-                f"CREATE TEMP TABLE stage_{entity} ({staging_columns})",
-                f"COPY stage_{entity} FROM 's3://{bucket}/{copy_key}' "
-                "IAM_ROLE default FORMAT AS PARQUET MANIFEST",
-            ]
+        statements.append(
+            f"CREATE TABLE IF NOT EXISTS {core_schema}.{entity} ({core_columns})"
         )
         count_queries.append(
             f"SELECT '{entity}' AS entity, COUNT(*) AS row_count FROM stage_{entity}"
         )
+    statements.extend(copy_statements)
     statements.append(" UNION ALL ".join(count_queries))
+    rows, session_id = _run_staging_batch(
+        redshift,
+        statements,
+        workgroup=workgroup,
+        database=database,
+        keep_alive=keep_alive,
+    )
+    actual_counts = _check_row_counts(rows, expected_counts)
+    return StagedSnapshot(published.source_manifest_uri, actual_counts), session_id
 
+
+def _sql_columns(columns: tuple[tuple[str, str], ...]) -> str:
+    return ", ".join(f"{name} {_REDSHIFT_TYPES[kind]}" for name, kind in columns)
+
+
+def _copy_batch(
+    s3: SnapshotSource,
+    published: PublishedDelivery,
+    layouts: dict[str, tuple[tuple[str, str], ...]],
+) -> tuple[list[str], Counter[str]]:
+    bucket, prefix = published.bucket, published.prefix
+    expected_counts: Counter[str] = Counter()
+    expected_urls: dict[str, set[str]] = {}
+    for entry in published.delivery.files:
+        expected_counts[entry.entity_type] += entry.row_count
+        expected_urls.setdefault(entry.entity_type, set()).add(
+            f"s3://{bucket}/{prefix}/{entry.relative_path}"
+        )
+
+    statements = []
+    for entity, columns in layouts.items():
+        if entity not in expected_urls:
+            continue
+        copy_key = f"{prefix}/copy/{entity}.json"
+        _verify_copy_manifest(s3, bucket, copy_key, expected_urls[entity])
+        statements.extend(
+            [
+                f"CREATE TEMP TABLE stage_{entity} ({_sql_columns(columns)})",
+                f"COPY stage_{entity} FROM 's3://{bucket}/{copy_key}' "
+                "IAM_ROLE default FORMAT AS PARQUET MANIFEST",
+            ]
+        )
+    return statements, expected_counts
+
+
+def _run_staging_batch(
+    redshift: RedshiftClient,
+    statements: list[str],
+    *,
+    workgroup: str,
+    database: str,
+    keep_alive: int,
+) -> tuple[list[list[dict[str, str | int]]], str | None]:
     batch = redshift.batch_execute_statement(
         WorkgroupName=workgroup,
         Database=database,
@@ -257,18 +332,21 @@ def _stage_snapshot(
         raise SnapshotStagingError(f"Missing count query result for {statement_id}")
     result_id = substatements[-1]["Id"]
     rows = redshift.get_statement_result(Id=result_id)["Records"]
-    actual_counts: dict[str, int] = {}
-    for entity_cell, count_cell in rows:
-        entity = str(entity_cell["stringValue"])
-        actual_counts[entity] = int(count_cell["longValue"])
+    return rows, batch.get("SessionId")
+
+
+def _check_row_counts(
+    rows: list[list[dict[str, str | int]]], expected_counts: Counter[str]
+) -> dict[str, int]:
+    actual_counts = {
+        str(row[0]["stringValue"]): int(row[1]["longValue"]) for row in rows
+    }
     if actual_counts != expected_counts:
         raise SnapshotStagingError(
             f"Staged row counts differ from the source manifest. "
             f"Expected {dict(expected_counts)}, got {actual_counts}"
         )
-    return StagedSnapshot(published.source_manifest_uri, actual_counts), batch.get(
-        "SessionId"
-    )
+    return actual_counts
 
 
 def _verify_copy_manifest(

@@ -1,4 +1,4 @@
-"""Read delivery manifests and verify local historical snapshot files."""
+"""Read delivery manifests and verify local v1 Parquet files."""
 
 import json
 import ntpath
@@ -42,6 +42,22 @@ SNAPSHOT_LAYOUTS = {
         ("unit_price", "money"),
         *_VERSION_COLUMNS,
     ),
+}
+_EVENT_COLUMNS = (
+    ("event_id", "string"),
+    ("entity_type", "string"),
+    ("record_id", "string"),
+    ("operation", "string"),
+    ("event_time", "timestamp"),
+    *_VERSION_COLUMNS,
+    ("arrival_at", "timestamp"),
+)
+INCREMENTAL_LAYOUTS = {
+    entity: (
+        *_EVENT_COLUMNS,
+        *(column for column in columns if column not in _VERSION_COLUMNS),
+    )
+    for entity, columns in SNAPSHOT_LAYOUTS.items()
 }
 _PARQUET_TYPES: dict[str, tuple[str, dict[str, object]]] = {
     "string": ("BYTE_ARRAY", {"Type": "String"}),
@@ -98,13 +114,21 @@ class BatchDelivery:
 
 
 def validate_snapshot_manifest(path: Path) -> SnapshotManifest:
-    """Read the manifest and verify every listed file without contacting AWS."""
+    """Verify a local historical v1 snapshot."""
+    return validate_delivery_manifest(path, historical_only=True)
+
+
+def validate_delivery_manifest(
+    path: Path, *, historical_only: bool = False
+) -> SnapshotManifest:
+    """Verify all local Parquet files in a historical or incremental v1 delivery."""
     try:
         path = path.expanduser().resolve()
         raw = path.read_bytes()
     except OSError as exc:
         raise ManifestValidationError(f"Cannot read manifest {path}: {exc}") from exc
-    delivery = parse_snapshot_manifest(raw)
+    delivery = parse_batch_manifest(raw, historical_only=historical_only)
+    layouts = v1_layouts(delivery)
     files = []
     seen_paths: set[Path] = set()
     for entry in delivery.files:
@@ -128,7 +152,7 @@ def validate_snapshot_manifest(path: Path) -> SnapshotManifest:
             entry.row_count,
             entry.sha256,
         )
-        _validate_parquet(file)
+        _validate_parquet(file, layouts[file.entity_type])
         files.append(file)
     return SnapshotManifest(
         path,
@@ -238,7 +262,18 @@ def _parse_file(entry: object, *, kind: str) -> BatchFileEntry:
     return BatchFileEntry(relative, entity, row_count, checksum, version)
 
 
-def _validate_parquet(file: SnapshotFile) -> None:
+def v1_layouts(delivery: BatchDelivery) -> dict[str, tuple[tuple[str, str], ...]]:
+    """Return the supported v1 column order or reject a newer delivery version."""
+    for file in delivery.files:
+        if file.schema_version != 1:
+            raise ManifestValidationError(
+                f"{file.relative_path}: unsupported {delivery.kind} schema "
+                f"version {file.schema_version}"
+            )
+    return SNAPSHOT_LAYOUTS if delivery.kind == "historical" else INCREMENTAL_LAYOUTS
+
+
+def _validate_parquet(file: SnapshotFile, layout: tuple[tuple[str, str], ...]) -> None:
     try:
         with file.path.open("rb") as source:
             if file_digest(source, "sha256").hexdigest() != file.sha256:
@@ -250,7 +285,7 @@ def _validate_parquet(file: SnapshotFile) -> None:
                         f"{file.relative_path}: expected {file.row_count} rows, "
                         f"found {parquet.metadata.num_rows} in Parquet footer"
                     )
-                _validate_layout(file, parquet)
+                _validate_layout(file, parquet, layout)
     except ManifestValidationError:
         raise
     except (OSError, ValueError) as exc:
@@ -259,9 +294,10 @@ def _validate_parquet(file: SnapshotFile) -> None:
         ) from exc
 
 
-def _validate_layout(file: SnapshotFile, parquet: pq.ParquetFile) -> None:
+def _validate_layout(
+    file: SnapshotFile, parquet: pq.ParquetFile, layout: tuple[tuple[str, str], ...]
+) -> None:
     schema = parquet.schema
-    layout = SNAPSHOT_LAYOUTS[file.entity_type]
     if schema.names != [name for name, _ in layout]:
         raise ManifestValidationError(
             f"{file.relative_path}: unexpected Parquet columns or order"

@@ -20,14 +20,14 @@ from retail_pipeline.discovery import (
     discover_deliveries,
     read_published_delivery,
 )
-from retail_pipeline.manifest import ManifestValidationError, validate_snapshot_manifest
+from retail_pipeline.manifest import ManifestValidationError, validate_delivery_manifest
 from retail_pipeline.staging import (
     RedshiftClient,
     SnapshotStagingError,
     load_snapshot,
     stage_snapshot,
 )
-from retail_pipeline.upload import S3Client, SnapshotUploadError, upload_snapshot
+from retail_pipeline.upload import S3Client, SnapshotUploadError, upload_delivery
 
 _S3_OPTIONS = (
     ("--aws-profile", "AWS_PROFILE", "Named AWS profile (optional)"),
@@ -54,8 +54,9 @@ def parse_settings(argv: list[str] | None = None) -> PipelineSettings:
     """Read pipeline settings, with CLI values overriding environment values."""
     parser = argparse.ArgumentParser(
         description="Display the pipeline configuration without connecting to AWS.",
-        epilog="Commands: validate-manifest, upload-snapshot, stage-snapshot, "
-        "load-snapshot, run-snapshot, discover-deliveries.",
+        epilog="Commands: validate-manifest, upload-delivery, upload-snapshot, "
+        "stage-snapshot, load-snapshot, run-snapshot, discover-deliveries, "
+        "stage-incremental.",
     )
     options = (
         ("--dataset-path", "RETAIL_DATASET_PATH", "Local dataset directory"),
@@ -99,7 +100,10 @@ def main() -> None:
         _validate_manifest_command(arguments[1:])
         return
     if arguments[:1] == ["upload-snapshot"]:
-        _upload_snapshot_command(arguments[1:])
+        _upload_delivery_command(arguments[1:], historical_only=True)
+        return
+    if arguments[:1] == ["upload-delivery"]:
+        _upload_delivery_command(arguments[1:])
         return
     if arguments[:1] == ["stage-snapshot"]:
         _stage_snapshot_command(arguments[1:])
@@ -113,6 +117,9 @@ def main() -> None:
     if arguments[:1] == ["discover-deliveries"]:
         _discover_deliveries_command(arguments[1:])
         return
+    if arguments[:1] == ["stage-incremental"]:
+        _stage_incremental_command(arguments[1:])
+        return
 
     settings = parse_settings(arguments)
     output = asdict(settings)
@@ -123,12 +130,12 @@ def main() -> None:
 def _validate_manifest_command(arguments: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog="retail-pipeline validate-manifest",
-        description="Verify one historical v1 snapshot locally.",
+        description="Verify one historical or incremental v1 delivery locally.",
     )
     parser.add_argument("manifest", type=Path)
     args = parser.parse_args(arguments)
     try:
-        snapshot = validate_snapshot_manifest(args.manifest)
+        snapshot = validate_delivery_manifest(args.manifest)
     except ManifestValidationError as exc:
         parser.exit(1, f"{parser.prog}: {exc}\n")
 
@@ -149,22 +156,32 @@ def _validate_manifest_command(arguments: list[str]) -> None:
     )
 
 
-def _upload_snapshot_command(arguments: list[str]) -> None:
+def _upload_delivery_command(
+    arguments: list[str], *, historical_only: bool = False
+) -> None:
+    command = "upload-snapshot" if historical_only else "upload-delivery"
+    source = (
+        "historical v1 snapshot"
+        if historical_only
+        else "historical or incremental v1 delivery"
+    )
     parser = argparse.ArgumentParser(
-        prog="retail-pipeline upload-snapshot",
-        description="Validate and upload one historical v1 snapshot to S3.",
+        prog=f"retail-pipeline {command}",
+        description=f"Validate and upload one {source} to S3.",
     )
     parser.add_argument("manifest", type=Path)
     _add_options(parser, _S3_OPTIONS)
     args = parser.parse_args(arguments)
     try:
-        snapshot = validate_snapshot_manifest(args.manifest)
+        delivery = validate_delivery_manifest(
+            args.manifest, historical_only=historical_only
+        )
         session = boto3.Session(
             profile_name=args.aws_profile, region_name=args.aws_region
         )
         with closing(session.client("s3")) as client:
-            published = upload_snapshot(
-                cast(S3Client, client), args.raw_bucket, snapshot
+            published = upload_delivery(
+                cast(S3Client, client), args.raw_bucket, delivery
             )
     except (
         ManifestValidationError,
@@ -248,6 +265,20 @@ def _run_snapshot_command(arguments: list[str]) -> None:
     from retail_pipeline.flows import run_snapshot
 
     run_snapshot(args.source_manifest_uri)
+
+
+def _stage_incremental_command(arguments: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="retail-pipeline stage-incremental",
+        description="Verify a published incremental v1 delivery in temporary staging.",
+    )
+    parser.add_argument("source_manifest_uri")
+    args = parser.parse_args(arguments)
+
+    from retail_pipeline.flows import run_incremental_staging
+
+    counts = run_incremental_staging(args.source_manifest_uri)
+    print(json.dumps(counts, indent=2))
 
 
 def _parse_cutoff(value: str) -> date:

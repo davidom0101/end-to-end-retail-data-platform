@@ -1,4 +1,4 @@
-"""Publish validated snapshot files and Redshift COPY manifests to S3."""
+"""Publish validated delivery files and Redshift COPY manifests to S3."""
 
 import json
 from base64 import b64encode
@@ -44,15 +44,15 @@ class PublishedSnapshot:
     copy_manifest_uris: dict[str, str]
 
 
-def upload_snapshot(
-    s3: S3Client, bucket: str, snapshot: SnapshotManifest
+def upload_delivery(
+    s3: S3Client, bucket: str, delivery: SnapshotManifest
 ) -> PublishedSnapshot:
-    """Publish a validated snapshot, writing its source manifest last."""
-    prefix = f"raw/{snapshot.dataset_id}/{snapshot.batch_id}"
+    """Publish a validated delivery, writing its source manifest last."""
+    prefix = f"raw/{delivery.dataset_id}/{delivery.batch_id}"
     manifest_key = f"{prefix}/manifest.json"
-    manifest_bytes = snapshot.path.read_bytes()
+    manifest_bytes = delivery.path.read_bytes()
     manifest_digest = sha256(manifest_bytes)
-    if manifest_digest.hexdigest() != snapshot.sha256:
+    if manifest_digest.hexdigest() != delivery.sha256:
         raise SnapshotUploadError("The source manifest changed after validation")
     manifest_checksum = b64encode(manifest_digest.digest()).decode("ascii")
 
@@ -63,7 +63,7 @@ def upload_snapshot(
             raise
 
     entries_by_entity: dict[str, list[dict[str, object]]] = {}
-    for file in sorted(snapshot.files, key=lambda file: file.relative_path):
+    for file in sorted(delivery.files, key=lambda file: file.relative_path):
         key = f"{prefix}/{file.relative_path}"
         checksum = b64encode(bytes.fromhex(file.sha256)).decode("ascii")
         with file.path.open("rb") as body:
@@ -89,6 +89,13 @@ def upload_snapshot(
         s3, bucket, manifest_key, manifest_bytes, manifest_checksum, len(manifest_bytes)
     )
     return PublishedSnapshot(f"s3://{bucket}/{manifest_key}", copy_manifest_uris)
+
+
+def upload_snapshot(
+    s3: S3Client, bucket: str, snapshot: SnapshotManifest
+) -> PublishedSnapshot:
+    """Publish a validated historical snapshot."""
+    return upload_delivery(s3, bucket, snapshot)
 
 
 def _put_immutable(

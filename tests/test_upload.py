@@ -1,13 +1,18 @@
 import json
+import sys
 from base64 import b64encode
-from datetime import date
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 from typing import BinaryIO
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from botocore.exceptions import ClientError
 
+from retail_pipeline import cli
 from retail_pipeline.manifest import SnapshotFile, SnapshotManifest
 from retail_pipeline.upload import SnapshotUploadError, upload_snapshot
 
@@ -17,6 +22,9 @@ PREFIX = "raw/test-v1/snapshot-001"
 class MemoryS3:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
+
+    def close(self) -> None:
+        pass
 
     def put_object(
         self,
@@ -127,3 +135,85 @@ def test_upload_refuses_changed_published_manifest(snapshot: SnapshotManifest) -
         upload_snapshot(s3, "retail-bucket", snapshot)
 
     assert s3.objects == {manifest_key: b"different source manifest"}
+
+
+@pytest.mark.parametrize("wrong_order", [False, True])
+def test_upload_delivery_validates_incremental_parquet_before_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wrong_order: bool
+) -> None:
+    at = datetime(2026, 11, 11, tzinfo=UTC)
+    table = pa.table(
+        {
+            "event_id": ["e1"],
+            "entity_type": ["orders"],
+            "record_id": ["o1"],
+            "operation": ["insert"],
+            "event_time": [at],
+            "updated_at": [at],
+            "source_sequence": [0],
+            "arrival_at": [at],
+            "order_id": ["o1"],
+            "customer_id": ["c1"],
+            "order_date": [at],
+            "status": ["paid"],
+        }
+    )
+    if wrong_order:
+        table = table.select(
+            ["record_id", "entity_type", "event_id", *table.column_names[3:]]
+        )
+    file = tmp_path / "orders.parquet"
+    pq.write_table(table, file, compression="snappy")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "dataset_id": "test-v1",
+                "batch_id": "daily-001",
+                "kind": "incremental",
+                "arrival_date": "2026-11-11",
+                "files": [
+                    {
+                        "path": file.name,
+                        "entity_type": "orders",
+                        "schema_version": 1,
+                        "row_count": 1,
+                        "sha256": sha256(file.read_bytes()).hexdigest(),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    s3 = MemoryS3()
+    monkeypatch.setattr(
+        cli.boto3, "Session", lambda **_: SimpleNamespace(client=lambda _: s3)
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "retail-pipeline",
+            "upload-delivery",
+            str(manifest),
+            "--raw-bucket",
+            "retail-bucket",
+            "--aws-region",
+            "eu-west-1",
+        ],
+    )
+
+    if wrong_order:
+        with pytest.raises(SystemExit) as failure:
+            cli.main()
+        assert failure.value.code == 1
+        assert not s3.objects
+    else:
+        cli.main()
+        prefix = "raw/test-v1/daily-001"
+        assert list(s3.objects) == [
+            f"{prefix}/orders.parquet",
+            f"{prefix}/copy/orders.json",
+            f"{prefix}/manifest.json",
+        ]
+        assert s3.objects[f"{prefix}/manifest.json"] == manifest.read_bytes()
