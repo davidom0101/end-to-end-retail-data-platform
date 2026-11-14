@@ -3,7 +3,7 @@ from io import BytesIO
 
 import pytest
 
-from retail_pipeline.staging import SnapshotStagingError, stage_snapshot
+from retail_pipeline.staging import SnapshotStagingError, load_snapshot, stage_snapshot
 
 BUCKET = "retail-raw"
 PREFIX = "raw/demo-v1/snapshot-001"
@@ -52,12 +52,25 @@ class RedshiftBatch:
     def __init__(self, counts: dict[str, int]) -> None:
         self.counts = counts
         self.statements: list[str] = []
+        self.core_statements: list[str] = []
 
     def batch_execute_statement(
-        self, *, WorkgroupName: str, Database: str, Sqls: list[str]
+        self,
+        *,
+        Sqls: list[str],
+        SessionKeepAliveSeconds: int,
+        WorkgroupName: str = "",
+        Database: str = "",
+        SessionId: str = "",
     ) -> dict:
+        if SessionId:
+            assert SessionId == "verified-staging-session"
+            assert SessionKeepAliveSeconds == 0
+            self.core_statements = Sqls
+            return {"Id": "core-batch"}
+
         self.statements = Sqls
-        return {"Id": "batch-id"}
+        return {"Id": "batch-id", "SessionId": "verified-staging-session"}
 
     def describe_statement(self, *, Id: str) -> dict:
         return {
@@ -128,3 +141,58 @@ def test_reports_row_count_mismatch() -> None:
             workgroup="retail-dev",
             database="retail",
         )
+
+
+def test_core_load_uses_verified_session_and_replaces_only_demo_tables() -> None:
+    redshift = RedshiftBatch(COUNTS)
+
+    loaded = load_snapshot(
+        PublishedObjects(),
+        redshift,
+        SOURCE_URI,
+        workgroup="retail-dev",
+        database="retail",
+        core_schema="core_demo",
+    )
+
+    assert loaded.row_counts == COUNTS
+    assert loaded.core_schema == "core_demo"
+    assert redshift.core_statements[1:5] == [
+        f"DELETE FROM core_demo.{entity}" for entity in reversed(COUNTS)
+    ]
+    inserts = redshift.core_statements[5:]
+    assert [sql.split()[2] for sql in inserts] == [
+        f"core_demo.{entity}" for entity in COUNTS
+    ]
+    assert "created_at, 0 FROM stage_customers" in inserts[0]
+    assert "0.00 FROM stage_order_items" in inserts[-1]
+
+
+def test_core_load_stops_before_mutation_when_staged_counts_differ() -> None:
+    redshift = RedshiftBatch({**COUNTS, "orders": 4899})
+
+    with pytest.raises(SnapshotStagingError, match="Staged row counts differ"):
+        load_snapshot(
+            PublishedObjects(),
+            redshift,
+            SOURCE_URI,
+            workgroup="retail-dev",
+            database="retail",
+            core_schema="core_demo",
+        )
+    assert not redshift.core_statements
+
+
+def test_core_load_rejects_target_outside_demo_namespace() -> None:
+    redshift = RedshiftBatch(COUNTS)
+
+    with pytest.raises(SnapshotStagingError, match="Target schema must be core_demo"):
+        load_snapshot(
+            PublishedObjects(),
+            redshift,
+            SOURCE_URI,
+            workgroup="retail-dev",
+            database="retail",
+            core_schema="core",
+        )
+    assert not redshift.statements

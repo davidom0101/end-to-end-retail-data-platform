@@ -16,6 +16,7 @@ from retail_pipeline.staging import (
     RedshiftClient,
     SnapshotSource,
     SnapshotStagingError,
+    load_snapshot,
     stage_snapshot,
 )
 from retail_pipeline.upload import S3Client, SnapshotUploadError, upload_snapshot
@@ -45,7 +46,8 @@ def parse_settings(argv: list[str] | None = None) -> PipelineSettings:
     """Read pipeline settings, with CLI values overriding environment values."""
     parser = argparse.ArgumentParser(
         description="Display the pipeline configuration without connecting to AWS.",
-        epilog="Snapshot commands: validate-manifest, upload-snapshot, stage-snapshot.",
+        epilog="Commands: validate-manifest, upload-snapshot, stage-snapshot, "
+        "load-snapshot.",
     )
     options = (
         ("--dataset-path", "RETAIL_DATASET_PATH", "Local dataset directory"),
@@ -93,6 +95,9 @@ def main() -> None:
         return
     if arguments[:1] == ["stage-snapshot"]:
         _stage_snapshot_command(arguments[1:])
+        return
+    if arguments[:1] == ["load-snapshot"]:
+        _stage_snapshot_command(arguments[1:], load_core=True)
         return
 
     settings = parse_settings(arguments)
@@ -158,12 +163,21 @@ def _upload_snapshot_command(arguments: list[str]) -> None:
     print(json.dumps(asdict(published), indent=2))
 
 
-def _stage_snapshot_command(arguments: list[str]) -> None:
+def _stage_snapshot_command(arguments: list[str], *, load_core: bool = False) -> None:
+    command = "load-snapshot" if load_core else "stage-snapshot"
     parser = argparse.ArgumentParser(
-        prog="retail-pipeline stage-snapshot",
-        description="Verify a published historical snapshot through Redshift staging.",
+        prog=f"retail-pipeline {command}",
+        description=(
+            "Replace the selected demo tables with a published historical snapshot."
+            if load_core
+            else "Verify a published historical snapshot through Redshift staging."
+        ),
     )
     parser.add_argument("source_manifest_uri")
+    if load_core:
+        parser.add_argument(
+            "--core-schema", required=True, help="core_demo or core_demo_<name>"
+        )
     _add_options(parser, (*_S3_OPTIONS[:2], *_WAREHOUSE_OPTIONS))
     args = parser.parse_args(arguments)
     try:
@@ -174,13 +188,31 @@ def _stage_snapshot_command(arguments: list[str]) -> None:
             closing(session.client("s3")) as s3,
             closing(session.client("redshift-data")) as redshift,
         ):
-            staged = stage_snapshot(
-                cast(SnapshotSource, s3),
-                cast(RedshiftClient, redshift),
-                args.source_manifest_uri,
-                workgroup=args.redshift_workgroup,
-                database=args.redshift_database,
-            )
+            source = cast(SnapshotSource, s3)
+            warehouse = cast(RedshiftClient, redshift)
+            connection = {
+                "workgroup": args.redshift_workgroup,
+                "database": args.redshift_database,
+            }
+            if load_core:
+                result = asdict(
+                    load_snapshot(
+                        source,
+                        warehouse,
+                        args.source_manifest_uri,
+                        core_schema=args.core_schema,
+                        **connection,
+                    )
+                )
+            else:
+                result = asdict(
+                    stage_snapshot(
+                        source,
+                        warehouse,
+                        args.source_manifest_uri,
+                        **connection,
+                    )
+                )
     except (
         ManifestValidationError,
         SnapshotStagingError,
@@ -188,4 +220,4 @@ def _stage_snapshot_command(arguments: list[str]) -> None:
         BotoCoreError,
     ) as exc:
         parser.exit(1, f"{parser.prog}: {exc}\n")
-    print(json.dumps(asdict(staged), indent=2))
+    print(json.dumps(result, indent=2))

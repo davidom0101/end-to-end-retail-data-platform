@@ -1,4 +1,4 @@
-"""Stage a published historical snapshot and verify the loaded row counts."""
+"""Stage and load published historical snapshots from S3."""
 
 import json
 import re
@@ -26,6 +26,7 @@ _SOURCE_URI = re.compile(
 
 class _Statement(TypedDict, total=False):
     Id: str
+    SessionId: str
     Status: str
     Error: str
     HasResultSet: bool
@@ -46,7 +47,13 @@ class SnapshotSource(Protocol):
 
 class RedshiftClient(Protocol):
     def batch_execute_statement(
-        self, *, WorkgroupName: str, Database: str, Sqls: list[str]
+        self,
+        *,
+        Sqls: list[str],
+        SessionKeepAliveSeconds: int,
+        WorkgroupName: str = ...,
+        Database: str = ...,
+        SessionId: str = ...,
     ) -> _Statement: ...
 
     def describe_statement(self, *, Id: str) -> _Statement: ...
@@ -64,6 +71,13 @@ class StagedSnapshot:
     row_counts: dict[str, int]
 
 
+@dataclass(frozen=True)
+class LoadedSnapshot:
+    source_manifest_uri: str
+    core_schema: str
+    row_counts: dict[str, int]
+
+
 def stage_snapshot(
     s3: SnapshotSource,
     redshift: RedshiftClient,
@@ -73,6 +87,78 @@ def stage_snapshot(
     database: str,
 ) -> StagedSnapshot:
     """COPY to session-local tables and report counts after verification."""
+    staged, _ = _stage_snapshot(
+        s3,
+        redshift,
+        source_manifest_uri,
+        workgroup=workgroup,
+        database=database,
+        core_schema="core",
+        keep_alive=0,
+    )
+    return staged
+
+
+def load_snapshot(
+    s3: SnapshotSource,
+    redshift: RedshiftClient,
+    source_manifest_uri: str,
+    *,
+    workgroup: str,
+    database: str,
+    core_schema: str,
+) -> LoadedSnapshot:
+    """Replace the four tables in the explicitly selected demo schema atomically."""
+    if not re.fullmatch(r"core_demo(?:_[a-z0-9_]{1,117})?", core_schema):
+        raise SnapshotStagingError(
+            "Target schema must be core_demo or core_demo_<name>"
+        )
+    staged, session_id = _stage_snapshot(
+        s3,
+        redshift,
+        source_manifest_uri,
+        workgroup=workgroup,
+        database=database,
+        core_schema=core_schema,
+        keep_alive=60,
+    )
+    if not session_id:
+        raise SnapshotStagingError("Redshift did not return the staging session ID")
+
+    tables = [f"{core_schema}.{entity}" for entity in SNAPSHOT_LAYOUTS]
+    # Acquire all write locks before the transaction takes its data snapshot.
+    statements = [f"LOCK TABLE {', '.join(tables)}"]
+    statements.extend(f"DELETE FROM {table}" for table in reversed(tables))
+    for entity, columns in SNAPSHOT_LAYOUTS.items():
+        names = [name for name, _ in columns]
+        values = names.copy()
+        if entity == "customers":
+            names.extend(("updated_at", "source_sequence"))
+            values.extend(("created_at", "0"))
+        if entity == "order_items":
+            names.append("discount_amount")
+            values.append("0.00")
+        statements.append(
+            f"INSERT INTO {core_schema}.{entity} ({', '.join(names)}) "
+            f"SELECT {', '.join(values)} FROM stage_{entity}"
+        )
+    batch = redshift.batch_execute_statement(
+        Sqls=statements, SessionId=session_id, SessionKeepAliveSeconds=0
+    )
+    _wait_for_statement(redshift, batch["Id"])
+    return LoadedSnapshot(source_manifest_uri, core_schema, staged.row_counts)
+
+
+def _stage_snapshot(
+    s3: SnapshotSource,
+    redshift: RedshiftClient,
+    source_manifest_uri: str,
+    *,
+    workgroup: str,
+    database: str,
+    core_schema: str,
+    keep_alive: int,
+) -> tuple[StagedSnapshot, str | None]:
     location = _SOURCE_URI.fullmatch(source_manifest_uri)
     if location is None:
         raise SnapshotStagingError(
@@ -92,7 +178,7 @@ def stage_snapshot(
             f"s3://{bucket}/{prefix}/{entry.relative_path}"
         )
 
-    statements = ["CREATE SCHEMA IF NOT EXISTS core"]
+    statements = [f"CREATE SCHEMA IF NOT EXISTS {core_schema}"]
     count_queries = []
     for entity, columns in SNAPSHOT_LAYOUTS.items():
         copy_key = f"{prefix}/copy/{entity}.json"
@@ -108,7 +194,7 @@ def stage_snapshot(
         # Temporary staging keeps retries and concurrent checks isolated.
         statements.extend(
             [
-                f"CREATE TABLE IF NOT EXISTS core.{entity} ({core_columns})",
+                f"CREATE TABLE IF NOT EXISTS {core_schema}.{entity} ({core_columns})",
                 f"CREATE TEMP TABLE stage_{entity} ({staging_columns})",
                 f"COPY stage_{entity} FROM 's3://{bucket}/{copy_key}' "
                 "IAM_ROLE default FORMAT AS PARQUET MANIFEST",
@@ -120,7 +206,10 @@ def stage_snapshot(
     statements.append(" UNION ALL ".join(count_queries))
 
     batch = redshift.batch_execute_statement(
-        WorkgroupName=workgroup, Database=database, Sqls=statements
+        WorkgroupName=workgroup,
+        Database=database,
+        Sqls=statements,
+        SessionKeepAliveSeconds=keep_alive,
     )
     statement_id = batch["Id"]
     finished = _wait_for_statement(redshift, statement_id)
@@ -138,7 +227,7 @@ def stage_snapshot(
             f"Staged row counts differ from the source manifest. "
             f"Expected {dict(expected_counts)}, got {actual_counts}"
         )
-    return StagedSnapshot(source_manifest_uri, actual_counts)
+    return StagedSnapshot(source_manifest_uri, actual_counts), batch.get("SessionId")
 
 
 def _read_object(s3: SnapshotSource, bucket: str, key: str) -> bytes:
