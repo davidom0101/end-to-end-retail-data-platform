@@ -1,5 +1,6 @@
 import json
 from collections.abc import Iterator
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,10 +67,15 @@ class PublishedObjects:
 
 class RedshiftBatch:
     def __init__(
-        self, counts: dict[str, int], *, invalid_ids: int | None = None
+        self,
+        counts: dict[str, int],
+        *,
+        invalid_ids: int | None = None,
+        core_outcome: str = "loaded",
     ) -> None:
         self.counts = counts
         self.invalid_ids = invalid_ids
+        self.core_outcome = core_outcome
         self.statements: list[str] = []
         self.core_statements: list[str] = []
 
@@ -94,11 +100,13 @@ class RedshiftBatch:
     def describe_statement(self, *, Id: str) -> dict:
         return {
             "Status": "FINISHED",
-            "SubStatements": [{"Id": "batch-id:13", "HasResultSet": True}],
+            "SubStatements": [{"Id": f"{Id}:last", "HasResultSet": True}],
         }
 
     def get_statement_result(self, *, Id: str) -> dict:
-        assert Id == "batch-id:13"
+        if Id == "core-batch:last":
+            return {"Records": [[{"stringValue": self.core_outcome}]]}
+        assert Id == "batch-id:last"
         invalid = [] if self.invalid_ids is None else [{"longValue": self.invalid_ids}]
         return {
             "Records": [
@@ -202,9 +210,13 @@ def test_incremental_staging_checks_row_counts_and_event_identity(
 
 def test_core_load_uses_verified_session_and_replaces_only_demo_tables() -> None:
     redshift = RedshiftBatch(COUNTS)
+    s3 = PublishedObjects()
+    checksum = sha256(
+        json.dumps(s3.objects[f"{PREFIX}/manifest.json"]).encode()
+    ).hexdigest()
 
     loaded = load_snapshot(
-        PublishedObjects(),
+        s3,
         redshift,
         SOURCE_URI,
         workgroup="retail-dev",
@@ -214,15 +226,48 @@ def test_core_load_uses_verified_session_and_replaces_only_demo_tables() -> None
 
     assert loaded.row_counts == COUNTS
     assert loaded.core_schema == "core_demo"
-    assert redshift.core_statements[1:5] == [
-        f"DELETE FROM core_demo.{entity}" for entity in reversed(COUNTS)
+    lock, *mutations, outcome = redshift.core_statements
+    assert lock.startswith("LOCK TABLE core_demo.applied_batches, core_demo.customers,")
+    deletes = mutations[:4]
+    assert [sql.split()[2] for sql in deletes] == [
+        f"core_demo.{entity}" for entity in reversed(COUNTS)
     ]
-    inserts = redshift.core_statements[5:]
+    inserts = mutations[4:8]
     assert [sql.split()[2] for sql in inserts] == [
         f"core_demo.{entity}" for entity in COUNTS
     ]
     assert "created_at, 0 FROM stage_customers" in inserts[0]
     assert "0.00 FROM stage_order_items" in inserts[-1]
+    for sql in deletes + inserts:
+        assert "WHERE NOT (EXISTS (SELECT 1 FROM core_demo.applied_batches" in sql
+        assert "kind = 'incremental'" in sql
+    ledger_insert = mutations[-1]
+    assert ledger_insert.startswith("INSERT INTO core_demo.applied_batches")
+    assert (
+        f"'demo-v1', 'snapshot-001', 'historical', '{checksum}', 800, 50, 4900, 8747"
+        in ledger_insert
+    )
+    assert "WHERE NOT EXISTS (SELECT 1 FROM core_demo.applied_batches)" in ledger_insert
+    assert "THEN 'daily-applied'" in outcome
+
+
+@pytest.mark.parametrize(
+    ("outcome", "message"),
+    [
+        ("daily-applied", "incremental batches have been applied"),
+        ("different-snapshot", "a different snapshot is already recorded"),
+    ],
+)
+def test_core_load_reports_ledger_protection(outcome: str, message: str) -> None:
+    with pytest.raises(SnapshotStagingError, match=message):
+        load_snapshot(
+            PublishedObjects(),
+            RedshiftBatch(COUNTS, core_outcome=outcome),
+            SOURCE_URI,
+            workgroup="retail-dev",
+            database="retail",
+            core_schema="core_demo",
+        )
 
 
 def test_core_load_stops_before_mutation_when_staged_counts_differ() -> None:
@@ -295,7 +340,9 @@ def test_run_snapshot_cli_runs_dbt_only_after_verified_core_load(
     process.wait.return_value = 1 if failure == "dbt" else 0
 
     def start_dbt(command: list[str], **kwargs: object) -> MagicMock:
-        assert redshift.core_statements[1] == "DELETE FROM core_demo_flow.order_items"
+        assert redshift.core_statements[1].startswith(
+            "DELETE FROM core_demo_flow.order_items WHERE "
+        )
         assert command[:5] == [
             "dbt",
             "--no-use-colors",

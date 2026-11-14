@@ -14,7 +14,7 @@ from retail_pipeline.discovery import (
     read_published_delivery,
     read_s3_object,
 )
-from retail_pipeline.manifest import SNAPSHOT_LAYOUTS, v1_layouts
+from retail_pipeline.manifest import BATCH_ID_PATTERN, SNAPSHOT_LAYOUTS, v1_layouts
 
 _REDSHIFT_TYPES = {
     "string": "VARCHAR(65535)",
@@ -70,6 +70,9 @@ class StagedSnapshotLoad:
     snapshot: StagedSnapshot
     core_schema: str
     session_id: str
+    dataset_id: str
+    batch_id: str
+    manifest_sha256: str
 
 
 @dataclass(frozen=True)
@@ -197,19 +200,46 @@ def stage_snapshot_for_load(
     )
     if not session_id:
         raise SnapshotStagingError("Redshift did not return the staging session ID")
-    return StagedSnapshotLoad(staged, core_schema, session_id)
+    return StagedSnapshotLoad(
+        staged,
+        core_schema,
+        session_id,
+        published.delivery.dataset_id,
+        published.delivery.batch_id,
+        published.manifest_sha256,
+    )
 
 
 def commit_snapshot_load(
     redshift: RedshiftClient, staged: StagedSnapshotLoad
 ) -> LoadedSnapshot:
-    """Replace the demo tables using the verified rows in the staging session."""
+    """Replace the demo tables and record the snapshot in one transaction."""
     core_schema = staged.core_schema
     _validate_core_schema(core_schema)
+    dataset_id, batch_id, checksum = (
+        staged.dataset_id,
+        staged.batch_id,
+        staged.manifest_sha256,
+    )
+    if not (
+        re.fullmatch(BATCH_ID_PATTERN, dataset_id)
+        and re.fullmatch(BATCH_ID_PATTERN, batch_id)
+        and re.fullmatch(r"[0-9a-f]{64}", checksum)
+    ):
+        raise SnapshotStagingError("Invalid staged manifest identity")
+    ledger = f"{core_schema}.applied_batches"
     tables = [f"{core_schema}.{entity}" for entity in SNAPSHOT_LAYOUTS]
-    # Acquire all write locks before the transaction takes its data snapshot.
-    statements = [f"LOCK TABLE {', '.join(tables)}"]
-    statements.extend(f"DELETE FROM {table}" for table in reversed(tables))
+    # Read the ledger only after taking the locks used to serialize applications.
+    statements = [f"LOCK TABLE {', '.join([ledger, *tables])}"]
+    has_daily = f"EXISTS (SELECT 1 FROM {ledger} WHERE kind = 'incremental')"
+    has_other_snapshot = (
+        f"EXISTS (SELECT 1 FROM {ledger} WHERE dataset_id <> '{dataset_id}' "
+        f"OR batch_id <> '{batch_id}' OR manifest_sha256 <> '{checksum}')"
+    )
+    can_load = f"NOT ({has_daily} OR {has_other_snapshot})"
+    statements.extend(
+        f"DELETE FROM {table} WHERE {can_load}" for table in reversed(tables)
+    )
     for entity, columns in SNAPSHOT_LAYOUTS.items():
         names = [name for name, _ in columns]
         values = names.copy()
@@ -221,12 +251,41 @@ def commit_snapshot_load(
             values.append("0.00")
         statements.append(
             f"INSERT INTO {core_schema}.{entity} ({', '.join(names)}) "
-            f"SELECT {', '.join(values)} FROM stage_{entity}"
+            f"SELECT {', '.join(values)} FROM stage_{entity} WHERE {can_load}"
         )
+    counts = ", ".join(
+        str(staged.snapshot.row_counts[entity]) for entity in SNAPSHOT_LAYOUTS
+    )
+    statements.extend(
+        [
+            f"INSERT INTO {ledger} (dataset_id, batch_id, kind, manifest_sha256, "
+            "customer_rows, product_rows, order_rows, order_item_rows) "
+            f"SELECT '{dataset_id}', '{batch_id}', 'historical', '{checksum}', "
+            f"{counts} "
+            f"WHERE NOT EXISTS (SELECT 1 FROM {ledger})",
+            f"SELECT CASE WHEN {has_daily} THEN 'daily-applied' "
+            f"WHEN {has_other_snapshot} THEN 'different-snapshot' ELSE 'loaded' END",
+        ]
+    )
     batch = redshift.batch_execute_statement(
         Sqls=statements, SessionId=staged.session_id, SessionKeepAliveSeconds=0
     )
-    _wait_for_statement(redshift, batch["Id"])
+    rows = _last_batch_result(redshift, batch["Id"])
+    if len(rows) != 1 or len(rows[0]) != 1:
+        raise SnapshotStagingError("Missing snapshot application outcome")
+    outcome = rows[0][0].get("stringValue")
+    if outcome == "daily-applied":
+        raise SnapshotStagingError(
+            f"Cannot replace {core_schema}: incremental batches have been applied"
+        )
+    if outcome == "different-snapshot":
+        raise SnapshotStagingError(
+            f"Cannot replace {core_schema}: a different snapshot is already recorded"
+        )
+    if outcome != "loaded":
+        raise SnapshotStagingError(
+            f"Unexpected snapshot application outcome: {outcome!r}"
+        )
     return LoadedSnapshot(
         staged.snapshot.source_manifest_uri, core_schema, staged.snapshot.row_counts
     )
@@ -251,6 +310,17 @@ def _stage_snapshot(
 ) -> tuple[StagedSnapshot, str | None]:
     copy_statements, expected_counts = _copy_batch(s3, published, SNAPSHOT_LAYOUTS)
     statements = [f"CREATE SCHEMA IF NOT EXISTS {core_schema}"]
+    if keep_alive:
+        # Create the ledger before the application transaction takes its locks.
+        statements.append(
+            f"CREATE TABLE IF NOT EXISTS {core_schema}.applied_batches ("
+            "dataset_id VARCHAR(1024) NOT NULL, batch_id VARCHAR(1024) NOT NULL, "
+            "kind VARCHAR(11) NOT NULL, manifest_sha256 CHAR(64) NOT NULL, "
+            "applied_at TIMESTAMP NOT NULL DEFAULT SYSDATE, "
+            "customer_rows BIGINT NOT NULL, product_rows BIGINT NOT NULL, "
+            "order_rows BIGINT NOT NULL, order_item_rows BIGINT NOT NULL, "
+            "PRIMARY KEY (dataset_id, batch_id))"
+        )
     count_queries = []
     for entity, columns in SNAPSHOT_LAYOUTS.items():
         core_columns = _sql_columns(columns)
@@ -325,14 +395,19 @@ def _run_staging_batch(
         Sqls=statements,
         SessionKeepAliveSeconds=keep_alive,
     )
-    statement_id = batch["Id"]
+    rows = _last_batch_result(redshift, batch["Id"])
+    return rows, batch.get("SessionId")
+
+
+def _last_batch_result(
+    redshift: RedshiftClient, statement_id: str
+) -> list[list[dict[str, str | int]]]:
     finished = _wait_for_statement(redshift, statement_id)
     substatements = finished.get("SubStatements", [])
     if not substatements or not substatements[-1].get("HasResultSet"):
-        raise SnapshotStagingError(f"Missing count query result for {statement_id}")
+        raise SnapshotStagingError(f"Missing final query result for {statement_id}")
     result_id = substatements[-1]["Id"]
-    rows = redshift.get_statement_result(Id=result_id)["Records"]
-    return rows, batch.get("SessionId")
+    return redshift.get_statement_result(Id=result_id)["Records"]
 
 
 def _check_row_counts(

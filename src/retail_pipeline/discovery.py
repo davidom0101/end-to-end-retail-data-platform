@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import date
+from hashlib import sha256
 from typing import BinaryIO, Literal, Protocol, TypedDict
 
 from retail_pipeline.manifest import (
@@ -57,6 +58,7 @@ class PublishedDelivery:
     bucket: str
     prefix: str
     delivery: BatchDelivery
+    manifest_sha256: str
 
 
 def read_s3_object(s3: SnapshotSource, bucket: str, key: str) -> bytes:
@@ -82,7 +84,9 @@ def read_published_delivery(
     )
     if prefix != f"raw/{delivery.dataset_id}/{delivery.batch_id}":
         raise DeliverySelectionError("Manifest IDs do not match its S3 key")
-    return PublishedDelivery(source_manifest_uri, bucket, prefix, delivery)
+    return PublishedDelivery(
+        source_manifest_uri, bucket, prefix, delivery, sha256(source_bytes).hexdigest()
+    )
 
 
 def discover_deliveries(
