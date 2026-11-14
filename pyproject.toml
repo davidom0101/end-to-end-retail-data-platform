@@ -44,5 +44,5 @@ strict = true
 files = ["src"]
 
 [[tool.mypy.overrides]]
-module = ["pyarrow", "pyarrow.parquet"]
+module = ["boto3", "botocore.exceptions", "pyarrow", "pyarrow.parquet"]
 ignore_missing_imports = true

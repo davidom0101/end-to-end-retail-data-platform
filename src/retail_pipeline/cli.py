@@ -3,10 +3,22 @@ import json
 import os
 import sys
 from collections import Counter
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import cast
+
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
 from retail_pipeline.manifest import ManifestValidationError, validate_snapshot_manifest
+from retail_pipeline.upload import S3Client, SnapshotUploadError, upload_snapshot
+
+_S3_OPTIONS = (
+    ("--aws-profile", "AWS_PROFILE", "Named AWS profile (optional)"),
+    ("--aws-region", "AWS_REGION", "AWS Region"),
+    ("--raw-bucket", "RETAIL_RAW_BUCKET", "Raw S3 bucket name"),
+)
 
 
 @dataclass(frozen=True)
@@ -23,27 +35,15 @@ def parse_settings(argv: list[str] | None = None) -> PipelineSettings:
     """Read pipeline settings, with CLI values overriding environment values."""
     parser = argparse.ArgumentParser(
         description="Display the pipeline configuration without connecting to AWS.",
-        epilog="Use 'retail-pipeline validate-manifest MANIFEST' to verify a snapshot.",
+        epilog="Snapshot commands: validate-manifest and upload-snapshot.",
     )
     options = (
         ("--dataset-path", "RETAIL_DATASET_PATH", "Local dataset directory"),
-        ("--aws-profile", "AWS_PROFILE", "Named AWS profile (optional)"),
-        ("--aws-region", "AWS_REGION", "AWS Region"),
-        ("--raw-bucket", "RETAIL_RAW_BUCKET", "Raw S3 bucket name"),
+        *_S3_OPTIONS,
         ("--redshift-workgroup", "RETAIL_REDSHIFT_WORKGROUP", "Redshift workgroup"),
         ("--redshift-database", "RETAIL_REDSHIFT_DATABASE", "Redshift database"),
     )
-    for flag, variable, description in options:
-        value = os.environ.get(variable)
-        if variable == "AWS_REGION":
-            value = value or os.environ.get("AWS_DEFAULT_REGION")
-        parser.add_argument(
-            flag,
-            default=value or None,
-            required=not value and variable != "AWS_PROFILE",
-            help=f"{description}. Environment: {variable}.",
-        )
-
+    _add_options(parser, options)
     args = parser.parse_args(argv)
     dataset_path = Path(args.dataset_path).expanduser().resolve()
     if not dataset_path.is_dir():
@@ -59,10 +59,28 @@ def parse_settings(argv: list[str] | None = None) -> PipelineSettings:
     )
 
 
+def _add_options(
+    parser: argparse.ArgumentParser, options: tuple[tuple[str, str, str], ...]
+) -> None:
+    for flag, variable, description in options:
+        value = os.environ.get(variable)
+        if variable == "AWS_REGION":
+            value = value or os.environ.get("AWS_DEFAULT_REGION")
+        parser.add_argument(
+            flag,
+            default=value or None,
+            required=not value and variable != "AWS_PROFILE",
+            help=f"{description}. Environment: {variable}.",
+        )
+
+
 def main() -> None:
     arguments = sys.argv[1:]
     if arguments[:1] == ["validate-manifest"]:
         _validate_manifest_command(arguments[1:])
+        return
+    if arguments[:1] == ["upload-snapshot"]:
+        _upload_snapshot_command(arguments[1:])
         return
 
     settings = parse_settings(arguments)
@@ -98,3 +116,31 @@ def _validate_manifest_command(arguments: list[str]) -> None:
             indent=2,
         )
     )
+
+
+def _upload_snapshot_command(arguments: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="retail-pipeline upload-snapshot",
+        description="Validate and upload one historical v1 snapshot to S3.",
+    )
+    parser.add_argument("manifest", type=Path)
+    _add_options(parser, _S3_OPTIONS)
+    args = parser.parse_args(arguments)
+    try:
+        snapshot = validate_snapshot_manifest(args.manifest)
+        session = boto3.Session(
+            profile_name=args.aws_profile, region_name=args.aws_region
+        )
+        with closing(session.client("s3")) as client:
+            published = upload_snapshot(
+                cast(S3Client, client), args.raw_bucket, snapshot
+            )
+    except (
+        ManifestValidationError,
+        SnapshotUploadError,
+        ClientError,
+        BotoCoreError,
+        OSError,
+    ) as exc:
+        parser.exit(1, f"{parser.prog}: {exc}\n")
+    print(json.dumps(asdict(published), indent=2))
