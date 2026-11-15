@@ -17,12 +17,14 @@ from prefect import flow, get_run_logger, task
 from prefect.client.schemas.objects import State
 from prefect.states import get_state_exception
 
+from retail_pipeline.audit import AuditBuffer, BatchKey, audit_stage, run_audit
 from retail_pipeline.classification import CLASSIFICATION_DECISIONS
 from retail_pipeline.discovery import (
     PublishedDelivery,
     SnapshotSource,
     VerifiedDeliverySource,
     discover_deliveries,
+    manifest_uri_batch_key,
     read_published_delivery,
     verify_delivery_files,
 )
@@ -80,14 +82,25 @@ _RETRY_OPTIONS: _RetryOptions = {
 }
 
 
+def _batch_key(published: PublishedDelivery) -> tuple[str, str]:
+    return published.delivery.dataset_id, published.delivery.batch_id
+
+
 @task(name="read-published-manifest", persist_result=False, **_RETRY_OPTIONS)
 def _read_manifest(
-    s3: SnapshotSource, source_manifest_uri: str, *, historical_only: bool = False
+    s3: SnapshotSource,
+    source_manifest_uri: str,
+    *,
+    historical_only: bool = False,
+    audit: AuditBuffer | None = None,
 ) -> PublishedDelivery:
-    if historical_only:
-        published = read_published_snapshot(s3, source_manifest_uri)
-    else:
-        published = read_published_delivery(s3, source_manifest_uri)
+    batch_key = manifest_uri_batch_key(source_manifest_uri) or (None, None)
+    with audit_stage(audit, "read_manifest", (batch_key,)) as outcome:
+        if historical_only:
+            published = read_published_snapshot(s3, source_manifest_uri)
+        else:
+            published = read_published_delivery(s3, source_manifest_uri)
+        outcome.batch_keys = (_batch_key(published),)
     get_run_logger().info(
         "Read dataset %s, batch %s from %s",
         published.delivery.dataset_id,
@@ -122,23 +135,35 @@ _classify_incremental = task(
 
 @task(name="read-applied-batches", persist_result=False, **_RETRY_OPTIONS)
 def _read_ledger(
-    redshift: RedshiftClient, *, workgroup: str, database: str, core_schema: str
+    redshift: RedshiftClient,
+    *,
+    workgroup: str,
+    database: str,
+    core_schema: str,
+    audit: AuditBuffer | None = None,
+    batch_keys: tuple[BatchKey, ...] = ((None, None),),
 ) -> dict[tuple[str, str], AppliedBatch]:
-    return read_applied_batches(
-        redshift, workgroup=workgroup, database=database, core_schema=core_schema
-    )
+    with audit_stage(audit, "read_ledger", batch_keys):
+        return read_applied_batches(
+            redshift, workgroup=workgroup, database=database, core_schema=core_schema
+        )
 
 
 @task(name="discover-published-deliveries", persist_result=False, **_RETRY_OPTIONS)
 def _discover(
-    s3: VerifiedDeliverySource, dataset_id: str, through: date
+    s3: VerifiedDeliverySource,
+    dataset_id: str,
+    through: date,
+    *,
+    audit: AuditBuffer | None = None,
 ) -> list[PublishedDelivery]:
-    deliveries = discover_deliveries(
-        s3,
-        bucket=_required_env("RETAIL_RAW_BUCKET"),
-        dataset_id=dataset_id,
-        cutoff=through,
-    )
+    with audit_stage(audit, "discover_deliveries", ((dataset_id, None),)):
+        deliveries = discover_deliveries(
+            s3,
+            bucket=_required_env("RETAIL_RAW_BUCKET"),
+            dataset_id=dataset_id,
+            cutoff=through,
+        )
     get_run_logger().info(
         "Discovered %s deliveries for %s", len(deliveries), dataset_id
     )
@@ -150,18 +175,25 @@ def _verified_replay(
     s3: VerifiedDeliverySource,
     published: PublishedDelivery,
     recorded: AppliedBatch | None,
+    *,
+    audit: AuditBuffer | None = None,
 ) -> bool:
-    delivery = published.delivery
-    if recorded and (
-        recorded.kind != delivery.kind
-        or recorded.manifest_sha256 != published.manifest_sha256
-    ):
-        raise SnapshotStagingError(
-            f"Applied batch {delivery.dataset_id}/{delivery.batch_id} "
-            "has a different manifest"
-        )
-    v1_layouts(delivery)
-    verify_delivery_files(s3, published)
+    with audit_stage(audit, "verify_delivery", (_batch_key(published),)) as outcome:
+        delivery = published.delivery
+        if recorded and (
+            recorded.kind != delivery.kind
+            or recorded.manifest_sha256 != published.manifest_sha256
+        ):
+            raise SnapshotStagingError(
+                f"Applied batch {delivery.dataset_id}/{delivery.batch_id} "
+                "has a different manifest"
+            )
+        v1_layouts(delivery)
+        verify_delivery_files(s3, published)
+        counts: dict[str, int] = {}
+        for file in delivery.files:
+            counts[file.entity_type] = counts.get(file.entity_type, 0) + file.row_count
+        outcome.row_counts = counts
     return recorded is not None
 
 
@@ -175,26 +207,39 @@ def _apply_incremental(
     database: str,
     core_schema: str,
     fail_before_commit: bool = False,
+    audit: AuditBuffer | None = None,
 ) -> AppliedDelivery:
-    return apply_incremental(
-        s3,
-        redshift,
-        published,
-        workgroup=workgroup,
-        database=database,
-        core_schema=core_schema,
-        fail_before_commit=fail_before_commit,
-    )
+    with audit_stage(audit, "core_application", (_batch_key(published),)) as outcome:
+        applied = apply_incremental(
+            s3,
+            redshift,
+            published,
+            workgroup=workgroup,
+            database=database,
+            core_schema=core_schema,
+            fail_before_commit=fail_before_commit,
+        )
+        outcome.status = "committed" if applied.status == "applied" else applied.status
+        outcome.row_counts = applied.counts
+        return applied
 
 
 @task(name="build-and-publish-mart", persist_result=False)
-def _build_mart(core_schema: str, project_dir: Path) -> None:
+def _build_mart(
+    core_schema: str,
+    project_dir: Path,
+    audit: AuditBuffer | None = None,
+    batch_keys: tuple[BatchKey, ...] = ((None, None),),
+) -> None:
     variables = {
         "core_schema": core_schema,
         "sales_candidate_suffix": f"_{uuid4().hex}",
     }
-    _run_dbt(["build"], project_dir, variables)
-    _run_dbt(["run-operation", "publish_daily_sales"], project_dir, variables)
+    with audit_stage(audit, "dbt_build", batch_keys):
+        _run_dbt(["build"], project_dir, variables)
+    with audit_stage(audit, "reporting_publication", batch_keys) as outcome:
+        _run_dbt(["run-operation", "publish_daily_sales"], project_dir, variables)
+        outcome.status = "published"
     get_run_logger().info("Published the validated mart_daily_sales view")
 
 
@@ -270,18 +315,22 @@ def _apply_snapshot(
     workgroup: str,
     database: str,
     core_schema: str,
+    audit: AuditBuffer | None = None,
 ) -> LoadedSnapshot:
-    staged = stage_snapshot_for_load(
-        s3,
-        redshift,
-        published,
-        workgroup=workgroup,
-        database=database,
-        core_schema=core_schema,
-    )
-    logger = get_run_logger()
-    logger.info("Verified staged row counts: %s", staged.snapshot.row_counts)
-    loaded = commit_snapshot_load(redshift, staged)
+    with audit_stage(audit, "core_application", (_batch_key(published),)) as outcome:
+        staged = stage_snapshot_for_load(
+            s3,
+            redshift,
+            published,
+            workgroup=workgroup,
+            database=database,
+            core_schema=core_schema,
+        )
+        logger = get_run_logger()
+        logger.info("Verified staged row counts: %s", staged.snapshot.row_counts)
+        outcome.row_counts = staged.snapshot.row_counts
+        loaded = commit_snapshot_load(redshift, staged)
+        outcome.status = "committed" if loaded.status == "applied" else loaded.status
     logger.info(
         "Snapshot %s in %s: %s", loaded.status, loaded.core_schema, loaded.row_counts
     )
@@ -296,15 +345,34 @@ def run_snapshot(source_manifest_uri: str) -> LoadedSnapshot:
     core_schema = _required_env("RETAIL_CORE_SCHEMA")
     project_dir = _dbt_project()
 
-    with _runner_clients() as (s3, redshift):
-        published = _read_manifest(s3, source_manifest_uri, historical_only=True)
-        ledger = _read_ledger(
+    with (
+        _runner_clients() as (s3, redshift),
+        run_audit(
             redshift, workgroup=workgroup, database=database, core_schema=core_schema
+        ) as audit,
+    ):
+        published = _read_manifest(
+            s3, source_manifest_uri, historical_only=True, audit=audit
+        )
+        batch_keys = (_batch_key(published),)
+        ledger = _read_ledger(
+            redshift,
+            workgroup=workgroup,
+            database=database,
+            core_schema=core_schema,
+            audit=audit,
+            batch_keys=batch_keys,
         )
         delivery = published.delivery
         if _verified_replay(
-            s3, published, ledger.get((delivery.dataset_id, delivery.batch_id))
+            s3,
+            published,
+            ledger.get((delivery.dataset_id, delivery.batch_id)),
+            audit=audit,
         ):
+            with audit_stage(audit, "core_application", batch_keys) as outcome:
+                outcome.status = "already_applied"
+                outcome.row_counts = {}
             counts: dict[str, int] = {}
             for file in delivery.files:
                 counts[file.entity_type] = (
@@ -324,9 +392,10 @@ def run_snapshot(source_manifest_uri: str) -> LoadedSnapshot:
                 workgroup=workgroup,
                 database=database,
                 core_schema=core_schema,
+                audit=audit,
             )
 
-    _build_mart(loaded.core_schema, project_dir)
+        _build_mart(loaded.core_schema, project_dir, audit, batch_keys)
     return loaded
 
 
@@ -368,18 +437,29 @@ def run_incremental_application(source_manifest_uri: str) -> AppliedDelivery:
     workgroup = _required_env("RETAIL_REDSHIFT_WORKGROUP")
     database = _required_env("RETAIL_REDSHIFT_DATABASE")
     core_schema = _required_env("RETAIL_CORE_SCHEMA")
-    with _runner_clients() as (s3, redshift):
-        published = _read_manifest(s3, source_manifest_uri)
+    with (
+        _runner_clients() as (s3, redshift),
+        run_audit(
+            redshift, workgroup=workgroup, database=database, core_schema=core_schema
+        ) as audit,
+    ):
+        published = _read_manifest(s3, source_manifest_uri, audit=audit)
         if published.delivery.kind != "incremental":
             raise SnapshotStagingError("Expected an incremental delivery manifest")
+        key = _batch_key(published)
         ledger = _read_ledger(
-            redshift, workgroup=workgroup, database=database, core_schema=core_schema
+            redshift,
+            workgroup=workgroup,
+            database=database,
+            core_schema=core_schema,
+            audit=audit,
+            batch_keys=(key,),
         )
-        delivery = published.delivery
-        if _verified_replay(
-            s3, published, ledger.get((delivery.dataset_id, delivery.batch_id))
-        ):
-            return AppliedDelivery("already_applied", {})
+        if _verified_replay(s3, published, ledger.get(key), audit=audit):
+            with audit_stage(audit, "core_application", (key,)) as outcome:
+                outcome.status = "already_applied"
+                outcome.row_counts = {}
+                return AppliedDelivery("already_applied", {})
         return _apply_incremental(
             s3,
             redshift,
@@ -387,6 +467,7 @@ def run_incremental_application(source_manifest_uri: str) -> AppliedDelivery:
             workgroup=workgroup,
             database=database,
             core_schema=core_schema,
+            audit=audit,
         )
 
 
@@ -412,22 +493,33 @@ def run_deliveries(
     core_schema = _required_env("RETAIL_CORE_SCHEMA")
     project_dir = _dbt_project()
     runs = []
-    with _runner_clients() as (s3, redshift):
+    with (
+        _runner_clients() as (s3, redshift),
+        run_audit(
+            redshift, workgroup=workgroup, database=database, core_schema=core_schema
+        ) as audit,
+    ):
         if source_manifest_uri is not None:
-            deliveries = [_read_manifest(s3, source_manifest_uri)]
+            deliveries = [_read_manifest(s3, source_manifest_uri, audit=audit)]
         else:
             assert dataset_id is not None and through is not None
-            deliveries = _discover(s3, dataset_id, through)
+            deliveries = _discover(s3, dataset_id, through, audit=audit)
         if not deliveries:
             return []
 
+        batch_keys = tuple(_batch_key(delivery) for delivery in deliveries)
         ledger = _read_ledger(
-            redshift, workgroup=workgroup, database=database, core_schema=core_schema
+            redshift,
+            workgroup=workgroup,
+            database=database,
+            core_schema=core_schema,
+            audit=audit,
+            batch_keys=batch_keys,
         )
         for published in deliveries:
             delivery = published.delivery
             key = (delivery.dataset_id, delivery.batch_id)
-            replay = _verified_replay(s3, published, ledger.get(key))
+            replay = _verified_replay(s3, published, ledger.get(key), audit=audit)
             if inject_failure is not None:
                 if delivery.kind != "incremental" or replay:
                     raise ValueError(
@@ -437,9 +529,13 @@ def run_deliveries(
                     "Injecting %s failure for %s/%s", inject_failure, *key
                 )
             if inject_failure == FailurePoint.BEFORE_CORE:
-                raise RuntimeError("Injected failure before core writes")
+                with audit_stage(audit, "before_core", (key,)):
+                    raise RuntimeError("Injected failure before core writes")
             if replay:
-                result = AppliedDelivery("already_applied", {})
+                with audit_stage(audit, "core_application", (key,)) as outcome:
+                    outcome.status = "already_applied"
+                    outcome.row_counts = {}
+                    result = AppliedDelivery("already_applied", {})
             elif delivery.kind == "historical":
                 loaded = _apply_snapshot(
                     s3,
@@ -448,6 +544,7 @@ def run_deliveries(
                     workgroup=workgroup,
                     database=database,
                     core_schema=core_schema,
+                    audit=audit,
                 )
                 counts = {}
                 if loaded.status == "applied":
@@ -464,6 +561,7 @@ def run_deliveries(
                     database=database,
                     core_schema=core_schema,
                     fail_before_commit=inject_failure == FailurePoint.BEFORE_COMMIT,
+                    audit=audit,
                 )
                 if inject_failure is not None and result.status == "already_applied":
                     raise ValueError(
@@ -473,8 +571,9 @@ def run_deliveries(
                 "Delivery %s/%s %s: %s", *key, result.status, result.counts
             )
             if inject_failure == FailurePoint.AFTER_COMMIT:
-                raise RuntimeError("Injected failure after core commit, before dbt")
+                with audit_stage(audit, "after_commit", (key,)):
+                    raise RuntimeError("Injected failure after core commit, before dbt")
             runs.append(DeliveryRun(*key, result.status, result.counts))
 
-    _build_mart(core_schema, project_dir)
+        _build_mart(core_schema, project_dir, audit, batch_keys)
     return runs

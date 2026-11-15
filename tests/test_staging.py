@@ -10,9 +10,11 @@ from unittest.mock import MagicMock
 
 import pytest
 from botocore.exceptions import ClientError, ReadTimeoutError
+from prefect import flow
 from prefect.testing.utilities import prefect_test_harness
 
 from retail_pipeline import flows, staging
+from retail_pipeline.audit import AuditBuffer
 from retail_pipeline.cli import main
 from retail_pipeline.discovery import DeliverySelectionError, read_published_delivery
 from retail_pipeline.manifest import ManifestValidationError
@@ -21,6 +23,7 @@ from retail_pipeline.staging import (
     AppliedDelivery,
     LoadedSnapshot,
     SnapshotStagingError,
+    SqlParameter,
     WarehouseOutcomeUnknown,
     load_snapshot,
     stage_incremental,
@@ -101,6 +104,7 @@ class RedshiftBatch:
         self.core_outcome = core_outcome
         self.statements: list[str] = []
         self.core_statements: list[str] = []
+        self.audit_records: list[dict] = []
 
     def batch_execute_statement(
         self,
@@ -111,7 +115,13 @@ class RedshiftBatch:
         Database: str = "",
         SessionId: str = "",
         ClientToken: str = "",
+        Parameters: list[SqlParameter] | None = None,
     ) -> dict:
+        if Parameters:
+            assert not SessionId and SessionKeepAliveSeconds == 0
+            assert Sqls[-1].startswith("INSERT INTO ")
+            self.audit_records.extend(json.loads(Parameters[0]["value"]))
+            return {"Id": "audit-batch"}
         if SessionId:
             assert SessionId == "verified-staging-session"
             assert SessionKeepAliveSeconds == 0
@@ -367,7 +377,20 @@ def test_prefect_retries_transient_s3_checks_only(
     verify = flows._verified_replay.with_options(retry_delay_seconds=0)
 
     if failure == "throttled":
-        assert verify(s3, published, None) is False
+        audit = AuditBuffer()
+
+        @flow
+        def verify_with_audit() -> bool:
+            return verify(s3, published, None, audit=audit)
+
+        assert verify_with_audit() is False
+        assert [(row["attempt"], row["status"]) for row in audit.records] == [
+            (1, "failed"),
+            (2, "succeeded"),
+        ]
+        assert audit.records[0]["failure_reason"] == "ClientError: SlowDown"
+        assert audit.records[1]["row_counts"] == {"orders": 1}
+        assert audit.records[0]["task_run_id"] == audit.records[1]["task_run_id"]
     elif failure == "unavailable":
         with pytest.raises(ClientError):
             verify(s3, published, None)
@@ -589,6 +612,25 @@ def test_delivery_cli_injects_failure_without_running_dbt(
     with pytest.raises(expected_error, match=message):
         main()
     assert events == expected_events
+    records = redshift.audit_records
+    assert len({record["run_id"] for record in records}) == 1
+    assert all(record["batch_id"] == "daily-001" for record in records)
+    assert all(
+        record["attempt"] == 1 and record["duration_ms"] >= 0 for record in records
+    )
+    failure_stages = {
+        "before-core": "before_core",
+        "before-commit": "core_application",
+        "after-commit": "after_commit",
+    }
+    assert records[-1]["stage"] == failure_stages[point]
+    assert (
+        records[-1]["status"] == "failed" and message in records[-1]["failure_reason"]
+    )
+    committed = [record for record in records if record["status"] == "committed"]
+    assert bool(committed) == (point == "after-commit")
+    if committed:
+        assert committed[0]["row_counts"] == {"orders": {"insert": 1}}
 
 
 @pytest.mark.usefixtures("prefect_server")
@@ -656,10 +698,15 @@ def test_run_snapshot_cli_publishes_only_after_core_load_and_dbt_build(
             main()
         assert redshift.core_statements == []
         fake_subprocess.Popen.assert_not_called()
+        assert redshift.audit_records[-1]["stage"] == "core_application"
+        assert redshift.audit_records[-1]["status"] == "failed"
     elif failure == "build":
         with pytest.raises(RuntimeError, match="dbt build failed with exit code 1"):
             main()
         assert commands == [["build"]]
+        assert redshift.audit_records[-2]["status"] == "committed"
+        assert redshift.audit_records[-1]["stage"] == "dbt_build"
+        assert redshift.audit_records[-1]["status"] == "failed"
     else:
         if failure == "publish":
             with pytest.raises(RuntimeError, match="publish_daily_sales failed"):
@@ -667,6 +714,11 @@ def test_run_snapshot_cli_publishes_only_after_core_load_and_dbt_build(
         else:
             main()
         assert commands == [["build"], ["run-operation", "publish_daily_sales"]]
+        assert redshift.audit_records[-3]["status"] == "committed"
+        assert redshift.audit_records[-1]["stage"] == "reporting_publication"
+        assert redshift.audit_records[-1]["status"] == (
+            "failed" if failure == "publish" else "published"
+        )
 
 
 @pytest.mark.usefixtures("prefect_server")
@@ -723,7 +775,9 @@ def test_run_deliveries_gates_warehouse_writes_and_dbt(
         )
 
     monkeypatch.setattr(s3, "close", lambda: None, raising=False)
-    clients = {"s3": s3, "redshift-data": SimpleNamespace(close=lambda: None)}
+    redshift = RedshiftBatch(COUNTS)
+    monkeypatch.setattr(redshift, "close", lambda: None, raising=False)
+    clients = {"s3": s3, "redshift-data": redshift}
     monkeypatch.setattr(
         flows.boto3, "Session", lambda **_: SimpleNamespace(client=clients.__getitem__)
     )

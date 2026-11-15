@@ -51,6 +51,11 @@ class _StatementResult(TypedDict):
     NextToken: NotRequired[str]
 
 
+class SqlParameter(TypedDict):
+    name: str
+    value: str
+
+
 type _ResultRows = list[list[dict[str, str | int]]]
 
 
@@ -64,6 +69,7 @@ class RedshiftClient(Protocol):
         Database: str = ...,
         SessionId: str = ...,
         ClientToken: str = ...,
+        Parameters: list[SqlParameter] = ...,
     ) -> _Statement: ...
 
     def describe_statement(self, *, Id: str) -> _Statement: ...

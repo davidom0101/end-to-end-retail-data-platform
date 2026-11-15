@@ -80,6 +80,15 @@ def read_s3_object(s3: SnapshotSource, bucket: str, key: str) -> bytes:
         return body.read()
 
 
+def manifest_uri_batch_key(source_manifest_uri: str) -> tuple[str, str] | None:
+    """Identify the delivery named in a valid URI before reading its manifest."""
+    location = _SOURCE_URI.fullmatch(source_manifest_uri)
+    if location is None:
+        return None
+    _, dataset_id, batch_id = location.group(2).split("/")
+    return dataset_id, batch_id
+
+
 def read_published_delivery(
     s3: SnapshotSource, source_manifest_uri: str, *, historical_only: bool = False
 ) -> PublishedDelivery:
