@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from botocore.exceptions import ClientError, ReadTimeoutError
 from prefect import flow
@@ -17,7 +19,11 @@ from retail_pipeline import flows, staging
 from retail_pipeline.audit import AuditBuffer
 from retail_pipeline.cli import main
 from retail_pipeline.discovery import DeliverySelectionError, read_published_delivery
-from retail_pipeline.manifest import ManifestValidationError
+from retail_pipeline.manifest import (
+    INCREMENTAL_LAYOUTS,
+    SNAPSHOT_LAYOUTS,
+    ManifestValidationError,
+)
 from retail_pipeline.staging import (
     AppliedBatch,
     AppliedDelivery,
@@ -36,24 +42,61 @@ SOURCE_URI = f"s3://{BUCKET}/{PREFIX}/manifest.json"
 COUNTS = {"customers": 800, "products": 50, "orders": 4900, "order_items": 8747}
 
 
+def order_item_parquet(*, incremental: bool, count: int, has_discount: bool) -> bytes:
+    layouts = INCREMENTAL_LAYOUTS if incremental else SNAPSHOT_LAYOUTS
+    types = {
+        "string": pa.string(),
+        "timestamp": pa.timestamp("us", tz="UTC"),
+        "int32": pa.int32(),
+        "int64": pa.int64(),
+        "money": pa.decimal128(12, 2),
+    }
+    columns = {
+        name: pa.nulls(count, type=types[kind]) for name, kind in layouts["order_items"]
+    }
+    if has_discount:
+        columns["discount_amount"] = pa.nulls(count, type=types["money"])
+    with BytesIO() as output:
+        pq.write_table(pa.table(columns), output, compression="snappy")
+        return output.getvalue()
+
+
 class PublishedObjects:
     def __init__(
-        self, *, incremental: bool = False, batch_id: str | None = None
+        self,
+        *,
+        incremental: bool = False,
+        batch_id: str | None = None,
+        order_item_version: int | None = None,
+        has_discount: bool = False,
     ) -> None:
         files = []
         self.objects = {}
         batch_id = batch_id or ("daily-001" if incremental else "snapshot-001")
         prefix = f"raw/demo-v1/{batch_id}"
-        counts = {"orders": 1} if incremental else COUNTS
+        counts = {"orders": 1} if incremental else COUNTS.copy()
+        if incremental and order_item_version:
+            counts = {"order_items": 1}
         for entity, count in counts.items():
             path = f"{entity}/part-001.parquet"
+            version = 1
+            checksum = "a" * 64
+            size = 10
+            if entity == "order_items":
+                data = order_item_parquet(
+                    incremental=incremental, count=count, has_discount=has_discount
+                )
+                self.objects[f"{prefix}/{path}"] = data
+                version = order_item_version or 1
+                checksum = sha256(data).hexdigest()
+                size = len(data)
             files.append(
                 {
                     "path": path,
                     "entity_type": entity,
-                    "schema_version": 1,
+                    "schema_version": version,
                     "row_count": count,
-                    "sha256": "a" * 64,
+                    "sha256": checksum,
                 }
             )
             self.objects[f"{prefix}/copy/{entity}.json"] = {
@@ -61,7 +104,7 @@ class PublishedObjects:
                     {
                         "url": f"s3://{BUCKET}/{prefix}/{path}",
                         "mandatory": True,
-                        "meta": {"content_length": 10},
+                        "meta": {"content_length": size},
                     }
                 ]
             }
@@ -75,7 +118,12 @@ class PublishedObjects:
 
     def get_object(self, *, Bucket: str, Key: str) -> dict:
         assert Bucket == BUCKET
-        return {"Body": BytesIO(json.dumps(self.objects[Key]).encode())}
+        value = self.objects[Key]
+        return {
+            "Body": BytesIO(
+                value if isinstance(value, bytes) else json.dumps(value).encode()
+            )
+        }
 
     def get_paginator(self, operation_name: str) -> SimpleNamespace:
         assert operation_name == "list_objects_v2"
@@ -88,7 +136,13 @@ class PublishedObjects:
     def head_object(self, *, Bucket: str, Key: str, ChecksumMode: str) -> dict:
         assert Bucket == BUCKET and ChecksumMode == "ENABLED"
         assert Key.endswith(".parquet")
-        return {"ChecksumSHA256": b64encode(bytes.fromhex("a" * 64)).decode("ascii")}
+        data = self.objects.get(Key)
+        digest = (
+            sha256(data).digest()
+            if isinstance(data, bytes)
+            else bytes.fromhex("a" * 64)
+        )
+        return {"ChecksumSHA256": b64encode(digest).decode("ascii")}
 
 
 class RedshiftBatch:
@@ -168,7 +222,8 @@ def test_stages_exact_files_from_s3_and_checks_all_entity_counts() -> None:
 
     assert staged.row_counts == COUNTS
     assert [sql for sql in redshift.statements if sql.startswith("COPY ")] == [
-        f"COPY stage_{entity} FROM 's3://{BUCKET}/{PREFIX}/copy/{entity}.json' "
+        f"COPY stage_{entity}{'_v1' if entity == 'order_items' else ''} "
+        f"FROM 's3://{BUCKET}/{PREFIX}/copy/{entity}.json' "
         "IAM_ROLE default FORMAT AS PARQUET MANIFEST"
         for entity in COUNTS
     ]
@@ -195,6 +250,27 @@ def test_rejects_copy_manifest_with_an_unlisted_file_before_running_sql() -> Non
         )
 
     assert redshift.statements == []
+
+
+@pytest.mark.parametrize("has_discount", [True, False])
+def test_order_item_v2_checks_physical_layout_before_copy(has_discount: bool) -> None:
+    s3 = PublishedObjects(
+        incremental=True, order_item_version=2, has_discount=has_discount
+    )
+    uri = f"s3://{BUCKET}/raw/demo-v1/daily-001/manifest.json"
+    published = read_published_delivery(s3, uri)
+    redshift = RedshiftBatch({"order_items": 1}, invalid_ids=0)
+    if not has_discount:
+        with pytest.raises(ManifestValidationError, match="unexpected Parquet columns"):
+            stage_incremental(
+                s3, redshift, published, workgroup="shop", database="retail"
+            )
+        assert redshift.statements == []
+    else:
+        assert stage_incremental(
+            s3, redshift, published, workgroup="shop", database="retail"
+        ) == {"order_items": 1}
+        assert redshift.statements[0].endswith("discount_amount DECIMAL(12,2))")
 
 
 def test_reports_row_count_mismatch() -> None:
@@ -276,7 +352,7 @@ def test_core_load_uses_verified_session_and_replaces_only_demo_tables() -> None
         f"core_demo.{entity}" for entity in COUNTS
     ]
     assert "created_at, 0 FROM stage_customers" in inserts[0]
-    assert "0.00 FROM stage_order_items" in inserts[-1]
+    assert "COALESCE(discount_amount, CAST(0 AS DECIMAL(12,2)))" in inserts[-1]
     for sql in deletes + inserts:
         assert "WHERE (SELECT status FROM snapshot_status) = 'applied'" in sql
     ledger_insert = mutations[-1]

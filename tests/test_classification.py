@@ -108,7 +108,7 @@ def test_v1_order_item_matches_null_and_zero_discounts(
         "item_id, order_id, product_id, quantity, unit_price, "
         "updated_at, source_sequence"
     )
-    warehouse.execute(f"CREATE TABLE stage_order_items ({columns})")
+    warehouse.execute(f"CREATE TABLE stage_order_items ({columns}, discount_amount)")
     warehouse.execute(
         f"CREATE TABLE core_demo.order_items ({columns}, discount_amount)"
     )
@@ -119,7 +119,7 @@ def test_v1_order_item_matches_null_and_zero_discounts(
     )
     warehouse.execute(
         "INSERT INTO stage_order_items SELECT item_id, order_id, product_id, quantity, "
-        "unit_price, updated_at, source_sequence FROM core_demo.order_items"
+        "unit_price, updated_at, source_sequence, 0 FROM core_demo.order_items"
     )
 
     warehouse.execute(classification_sql("order_items", "core_demo"))
@@ -132,3 +132,31 @@ def test_v1_order_item_matches_null_and_zero_discounts(
         ("I2", "duplicate", 0),
         ("I3", "conflict_with_core", 0),
     ]
+
+
+def test_v2_discount_participates_in_version_comparison(
+    warehouse: sqlite3.Connection,
+) -> None:
+    columns = (
+        "item_id, order_id, product_id, quantity, unit_price, "
+        "updated_at, source_sequence, discount_amount"
+    )
+    warehouse.execute(f"CREATE TABLE stage_order_items ({columns})")
+    warehouse.execute(f"CREATE TABLE core_demo.order_items ({columns})")
+    warehouse.execute(
+        "INSERT INTO core_demo.order_items "
+        "VALUES ('I1', 'O1', 'P1', 1, 10, '2026-01-01', 1, 2)"
+    )
+    warehouse.execute(
+        "INSERT INTO stage_order_items "
+        "VALUES ('I1', 'O1', 'P1', 1, 10, '2026-01-01', 1, 3)"
+    )
+    warehouse.execute(
+        "INSERT INTO stage_order_items "
+        "VALUES ('I1', 'O1', 'P1', 1, 10, '2026-01-02', 1, 4)"
+    )
+    warehouse.execute(classification_sql("order_items", "core_demo"))
+    assert warehouse.execute(
+        "SELECT decision, discount_amount FROM classified_order_items "
+        "ORDER BY discount_amount"
+    ).fetchall() == [("conflict_with_core", 3), ("update", 4)]

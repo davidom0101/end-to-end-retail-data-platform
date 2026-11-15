@@ -25,9 +25,9 @@ def warehouse() -> Iterator[sqlite3.Connection]:
             columns = [name for name, _ in layout]
             if entity == "customers":
                 columns.extend(("updated_at", "source_sequence"))
-            connection.execute(f"CREATE TABLE stage_{entity} ({', '.join(columns)})")
             if entity == "order_items":
                 columns.append("discount_amount")
+            connection.execute(f"CREATE TABLE stage_{entity} ({', '.join(columns)})")
             connection.execute(f"CREATE TABLE {CORE}.{entity} ({', '.join(columns)})")
         connection.execute(f"""
             CREATE TABLE {CORE}.applied_batches (
@@ -93,7 +93,8 @@ def _stage_rows(connection: sqlite3.Connection, customer_id: str = "C1") -> None
         (customer_id,),
     )
     connection.execute("""
-        INSERT INTO stage_order_items VALUES ('I1', 'O1', 'P0', 2, 8, '2026-01-02', 1)
+        INSERT INTO stage_order_items
+        VALUES ('I1', 'O1', 'P0', 2, 8, '2026-01-02', 1, 0)
     """)
     connection.commit()
 

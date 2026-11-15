@@ -139,7 +139,7 @@ def main() -> None:
 def _validate_manifest_command(arguments: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog="retail-pipeline validate-manifest",
-        description="Verify one historical or incremental v1 delivery locally.",
+        description="Verify one historical or incremental delivery locally.",
     )
     parser.add_argument("manifest", type=Path)
     args = parser.parse_args(arguments)
@@ -170,9 +170,9 @@ def _upload_delivery_command(
 ) -> None:
     command = "upload-snapshot" if historical_only else "upload-delivery"
     source = (
-        "historical v1 snapshot"
+        "historical snapshot"
         if historical_only
-        else "historical or incremental v1 delivery"
+        else "historical or incremental delivery"
     )
     parser = argparse.ArgumentParser(
         prog=f"retail-pipeline {command}",
@@ -279,7 +279,7 @@ def _run_snapshot_command(arguments: list[str]) -> None:
 def _stage_incremental_command(arguments: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog="retail-pipeline stage-incremental",
-        description="Verify a published incremental v1 delivery in temporary staging.",
+        description="Verify a published incremental delivery in temporary staging.",
     )
     parser.add_argument("source_manifest_uri")
     args = parser.parse_args(arguments)
@@ -293,7 +293,7 @@ def _stage_incremental_command(arguments: list[str]) -> None:
 def _classify_incremental_command(arguments: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog="retail-pipeline classify-incremental",
-        description="Preview incremental v1 decisions against the demo target.",
+        description="Preview incremental decisions against the demo target.",
     )
     parser.add_argument("source_manifest_uri")
     args = parser.parse_args(arguments)
@@ -307,7 +307,7 @@ def _classify_incremental_command(arguments: list[str]) -> None:
 def _apply_incremental_command(arguments: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog="retail-pipeline apply-incremental",
-        description="Apply a published incremental v1 delivery to the demo target.",
+        description="Apply a published incremental delivery to the demo target.",
     )
     parser.add_argument("source_manifest_uri")
     args = parser.parse_args(arguments)

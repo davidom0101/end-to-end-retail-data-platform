@@ -1,4 +1,4 @@
-"""Read delivery manifests and verify local v1 Parquet files."""
+"""Read delivery manifests and verify Parquet layouts."""
 
 import json
 import ntpath
@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import date
 from hashlib import file_digest, sha256
 from pathlib import Path
+from typing import BinaryIO
 
 import pyarrow.parquet as pq
 
@@ -59,6 +60,7 @@ INCREMENTAL_LAYOUTS = {
     )
     for entity, columns in SNAPSHOT_LAYOUTS.items()
 }
+DISCOUNT_COLUMN = ("discount_amount", "money")
 _PARQUET_TYPES: dict[str, tuple[str, dict[str, object]]] = {
     "string": ("BYTE_ARRAY", {"Type": "String"}),
     "bool": ("BOOLEAN", {"Type": "None"}),
@@ -114,21 +116,20 @@ class BatchDelivery:
 
 
 def validate_snapshot_manifest(path: Path) -> SnapshotManifest:
-    """Verify a local historical v1 snapshot."""
+    """Verify a local historical snapshot."""
     return validate_delivery_manifest(path, historical_only=True)
 
 
 def validate_delivery_manifest(
     path: Path, *, historical_only: bool = False
 ) -> SnapshotManifest:
-    """Verify all local Parquet files in a historical or incremental v1 delivery."""
+    """Verify all local Parquet files in a historical or incremental delivery."""
     try:
         path = path.expanduser().resolve()
         raw = path.read_bytes()
     except OSError as exc:
         raise ManifestValidationError(f"Cannot read manifest {path}: {exc}") from exc
     delivery = parse_batch_manifest(raw, historical_only=historical_only)
-    layouts = v1_layouts(delivery)
     files = []
     seen_paths: set[Path] = set()
     for entry in delivery.files:
@@ -152,7 +153,18 @@ def validate_delivery_manifest(
             entry.row_count,
             entry.sha256,
         )
-        _validate_parquet(file, layouts[file.entity_type])
+        try:
+            with file.path.open("rb") as source:
+                if file_digest(source, "sha256").hexdigest() != entry.sha256:
+                    raise ManifestValidationError(
+                        f"{entry.relative_path}: SHA-256 mismatch"
+                    )
+                source.seek(0)
+                validate_parquet_footer(source, entry, kind=delivery.kind)
+        except OSError as exc:
+            raise ManifestValidationError(
+                f"Cannot read {entry.relative_path}: {exc}"
+            ) from exc
         files.append(file)
     return SnapshotManifest(
         path,
@@ -165,7 +177,7 @@ def validate_delivery_manifest(
 
 
 def parse_snapshot_manifest(raw: bytes) -> BatchDelivery:
-    """Validate historical v1 manifest metadata independently of file storage."""
+    """Validate historical manifest metadata independently of file storage."""
     return parse_batch_manifest(raw, historical_only=True)
 
 
@@ -243,9 +255,7 @@ def _parse_file(entry: object, *, kind: str) -> BatchFileEntry:
     if not isinstance(entity, str) or entity not in SNAPSHOT_LAYOUTS:
         raise ManifestValidationError(f"{relative}: unknown entity_type {entity!r}")
     version = entry.get("schema_version")
-    allowed_versions = (
-        (1, 2) if kind == "incremental" and entity == "order_items" else (1,)
-    )
+    allowed_versions = (1, 2) if entity == "order_items" else (1,)
     if type(version) is not int or version not in allowed_versions:
         label = "snapshot" if kind == "historical" else "incremental"
         raise ManifestValidationError(
@@ -262,30 +272,24 @@ def _parse_file(entry: object, *, kind: str) -> BatchFileEntry:
     return BatchFileEntry(relative, entity, row_count, checksum, version)
 
 
-def v1_layouts(delivery: BatchDelivery) -> dict[str, tuple[tuple[str, str], ...]]:
-    """Return the supported v1 column order or reject a newer delivery version."""
-    for file in delivery.files:
-        if file.schema_version != 1:
-            raise ManifestValidationError(
-                f"{file.relative_path}: unsupported {delivery.kind} schema "
-                f"version {file.schema_version}"
-            )
-    return SNAPSHOT_LAYOUTS if delivery.kind == "historical" else INCREMENTAL_LAYOUTS
+def parquet_layout(file: BatchFileEntry, *, kind: str) -> tuple[tuple[str, str], ...]:
+    layouts = SNAPSHOT_LAYOUTS if kind == "historical" else INCREMENTAL_LAYOUTS
+    columns = layouts[file.entity_type]
+    return (*columns, DISCOUNT_COLUMN) if file.schema_version == 2 else columns
 
 
-def _validate_parquet(file: SnapshotFile, layout: tuple[tuple[str, str], ...]) -> None:
+def validate_parquet_footer(
+    source: BinaryIO, file: BatchFileEntry, *, kind: str
+) -> None:
+    """Check row count, column order and physical types using the Parquet footer."""
     try:
-        with file.path.open("rb") as source:
-            if file_digest(source, "sha256").hexdigest() != file.sha256:
-                raise ManifestValidationError(f"{file.relative_path}: SHA-256 mismatch")
-            source.seek(0)
-            with pq.ParquetFile(source) as parquet:
-                if parquet.metadata.num_rows != file.row_count:
-                    raise ManifestValidationError(
-                        f"{file.relative_path}: expected {file.row_count} rows, "
-                        f"found {parquet.metadata.num_rows} in Parquet footer"
-                    )
-                _validate_layout(file, parquet, layout)
+        with pq.ParquetFile(source) as parquet:
+            if parquet.metadata.num_rows != file.row_count:
+                raise ManifestValidationError(
+                    f"{file.relative_path}: expected {file.row_count} rows, "
+                    f"found {parquet.metadata.num_rows} in Parquet footer"
+                )
+            _validate_layout(file, parquet, parquet_layout(file, kind=kind))
     except ManifestValidationError:
         raise
     except (OSError, ValueError) as exc:
@@ -295,7 +299,7 @@ def _validate_parquet(file: SnapshotFile, layout: tuple[tuple[str, str], ...]) -
 
 
 def _validate_layout(
-    file: SnapshotFile, parquet: pq.ParquetFile, layout: tuple[tuple[str, str], ...]
+    file: BatchFileEntry, parquet: pq.ParquetFile, layout: tuple[tuple[str, str], ...]
 ) -> None:
     schema = parquet.schema
     if schema.names != [name for name, _ in layout]:

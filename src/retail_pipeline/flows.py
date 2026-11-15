@@ -28,7 +28,6 @@ from retail_pipeline.discovery import (
     read_published_delivery,
     verify_delivery_files,
 )
-from retail_pipeline.manifest import v1_layouts
 from retail_pipeline.staging import (
     AppliedBatch,
     AppliedDelivery,
@@ -188,7 +187,6 @@ def _verified_replay(
                 f"Applied batch {delivery.dataset_id}/{delivery.batch_id} "
                 "has a different manifest"
             )
-        v1_layouts(delivery)
         verify_delivery_files(s3, published)
         counts: dict[str, int] = {}
         for file in delivery.files:
@@ -401,7 +399,7 @@ def run_snapshot(source_manifest_uri: str) -> LoadedSnapshot:
 
 @flow(name="incremental-staging", persist_result=False)
 def run_incremental_staging(source_manifest_uri: str) -> dict[str, int]:
-    """Stage and verify a published incremental v1 delivery."""
+    """Stage and verify a published incremental delivery."""
     workgroup = _required_env("RETAIL_REDSHIFT_WORKGROUP")
     database = _required_env("RETAIL_REDSHIFT_DATABASE")
     with _runner_clients() as (s3, redshift):

@@ -96,6 +96,12 @@ END AS status
 
 def _validation_sql(core_schema: str, counts: dict[str, int]) -> str:
     checks = [f"SELECT * FROM apply_summary WHERE decision NOT IN ({_DECISIONS})"]
+    if "order_items" in counts:
+        checks.append(
+            "SELECT 'order_items', 'invalid_discount', COUNT(*), 0, MIN(item_id) "
+            "FROM stage_order_items WHERE discount_amount < 0 "
+            "OR discount_amount > quantity * unit_price HAVING COUNT(*) > 0"
+        )
     for entity, expected in counts.items():
         checks.append(
             f"SELECT '{entity}', 'classification_count_mismatch', 0, 0, '' "

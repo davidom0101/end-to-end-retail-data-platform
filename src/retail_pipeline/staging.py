@@ -4,6 +4,8 @@ import json
 import re
 from collections import Counter
 from dataclasses import dataclass
+from hashlib import sha256
+from io import BytesIO
 from time import monotonic, sleep
 from typing import NotRequired, Protocol, TypedDict
 from uuid import uuid4
@@ -23,7 +25,12 @@ from retail_pipeline.discovery import (
     read_published_delivery,
     read_s3_object,
 )
-from retail_pipeline.manifest import BATCH_ID_PATTERN, SNAPSHOT_LAYOUTS, v1_layouts
+from retail_pipeline.manifest import (
+    BATCH_ID_PATTERN,
+    SNAPSHOT_LAYOUTS,
+    parquet_layout,
+    validate_parquet_footer,
+)
 from retail_pipeline.transient import is_aws_throttled, is_transient_aws_error
 
 _REDSHIFT_TYPES = {
@@ -223,7 +230,7 @@ def stage_incremental(
     workgroup: str,
     database: str,
 ) -> dict[str, int]:
-    """Verify one incremental v1 delivery in session-local staging tables."""
+    """Verify one incremental delivery in session-local staging tables."""
     counts, _ = _stage_incremental(
         s3, redshift, published, workgroup=workgroup, database=database, keep_alive=0
     )
@@ -239,7 +246,7 @@ def classify_incremental(
     database: str,
     core_schema: str,
 ) -> dict[str, dict[str, int]]:
-    """Stage a v1 delivery, then preview its decisions against an existing target."""
+    """Stage a delivery, then preview its decisions against an existing target."""
     _validate_core_schema(core_schema)
     counts, session_id = _stage_incremental_for_core(
         s3, redshift, published, workgroup=workgroup, database=database
@@ -264,7 +271,7 @@ def apply_incremental(
     core_schema: str,
     fail_before_commit: bool = False,
 ) -> AppliedDelivery:
-    """Apply one published v1 delivery after validating it in a locked transaction."""
+    """Apply one published delivery after validating it in a locked transaction."""
     _validate_core_schema(core_schema)
     _validate_manifest_identity(
         published.delivery.dataset_id,
@@ -327,6 +334,7 @@ def _read_classification(
         "missing_customer_id": "Missing customer reference",
         "missing_order_id": "Missing order reference",
         "missing_product_id": "Missing product reference",
+        "invalid_discount": "Discount is outside the line amount",
     }
     for entity_cell, decision_cell, versions, repeated, sample in rows:
         entity = str(entity_cell["stringValue"])
@@ -381,8 +389,7 @@ def _stage_incremental(
 ) -> tuple[dict[str, int], str | None]:
     if published.delivery.kind != "incremental":
         raise SnapshotStagingError("Expected an incremental delivery manifest")
-    layouts = v1_layouts(published.delivery)
-    statements, expected_counts = _copy_batch(s3, published, layouts)
+    statements, expected_counts = _copy_batch(s3, published)
     count_queries = []
     for entity in expected_counts:
         business_key = SNAPSHOT_LAYOUTS[entity][0][0]
@@ -516,7 +523,7 @@ END AS status
             values.extend(("created_at", "0"))
         if entity == "order_items":
             names.append("discount_amount")
-            values.append("0.00")
+            values.append("COALESCE(discount_amount, CAST(0 AS DECIMAL(12,2)))")
         statements.append(
             f"INSERT INTO {core_schema}.{entity} ({', '.join(names)}) "
             f"SELECT {', '.join(values)} FROM stage_{entity} WHERE {can_load}"
@@ -600,7 +607,7 @@ def _stage_snapshot(
     core_schema: str,
     keep_alive: int,
 ) -> tuple[StagedSnapshot, str | None]:
-    copy_statements, expected_counts = _copy_batch(s3, published, SNAPSHOT_LAYOUTS)
+    copy_statements, expected_counts = _copy_batch(s3, published)
     statements = [f"CREATE SCHEMA IF NOT EXISTS {core_schema}"]
     if keep_alive:
         # Create the ledger before the application transaction takes its locks.
@@ -646,30 +653,51 @@ def _sql_columns(columns: tuple[tuple[str, str], ...]) -> str:
 def _copy_batch(
     s3: SnapshotSource,
     published: PublishedDelivery,
-    layouts: dict[str, tuple[tuple[str, str], ...]],
 ) -> tuple[list[str], Counter[str]]:
     bucket, prefix = published.bucket, published.prefix
     expected_counts: Counter[str] = Counter()
     expected_urls: dict[str, set[str]] = {}
+    files_by_entity = {}
     for entry in published.delivery.files:
         expected_counts[entry.entity_type] += entry.row_count
-        expected_urls.setdefault(entry.entity_type, set()).add(
-            f"s3://{bucket}/{prefix}/{entry.relative_path}"
-        )
+        key = f"{prefix}/{entry.relative_path}"
+        expected_urls.setdefault(entry.entity_type, set()).add(f"s3://{bucket}/{key}")
+        files_by_entity[entry.entity_type] = entry
+        if entry.entity_type == "order_items":
+            # Check the exact bytes Redshift will load before submitting any COPY.
+            data = read_s3_object(s3, bucket, key)
+            if sha256(data).hexdigest() != entry.sha256:
+                raise SnapshotStagingError(f"SHA-256 mismatch for s3://{bucket}/{key}")
+            validate_parquet_footer(BytesIO(data), entry, kind=published.delivery.kind)
 
     statements = []
-    for entity, columns in layouts.items():
-        if entity not in expected_urls:
+    for entity in SNAPSHOT_LAYOUTS:
+        if entity not in files_by_entity:
             continue
+        entry = files_by_entity[entity]
+        columns = parquet_layout(entry, kind=published.delivery.kind)
+        missing_discount = entity == "order_items" and entry.schema_version == 1
+        table = f"stage_{entity}_v1" if missing_discount else f"stage_{entity}"
         copy_key = f"{prefix}/copy/{entity}.json"
         _verify_copy_manifest(s3, bucket, copy_key, expected_urls[entity])
         statements.extend(
             [
-                f"CREATE TEMP TABLE stage_{entity} ({_sql_columns(columns)})",
-                f"COPY stage_{entity} FROM 's3://{bucket}/{copy_key}' "
+                f"CREATE TEMP TABLE {table} ({_sql_columns(columns)})",
+                f"COPY {table} FROM 's3://{bucket}/{copy_key}' "
                 "IAM_ROLE default FORMAT AS PARQUET MANIFEST",
             ]
         )
+        if missing_discount:
+            statements.append(
+                "CREATE TEMP TABLE stage_order_items AS SELECT *, "
+                "CAST(0 AS DECIMAL(12,2)) AS discount_amount FROM stage_order_items_v1"
+            )
+        elif entity == "order_items" and published.delivery.kind == "historical":
+            statements.append(
+                "SELECT CAST(CASE WHEN COUNT(*) > 0 THEN 'invalid snapshot discount' "
+                "ELSE '0' END AS INTEGER) FROM stage_order_items "
+                "WHERE discount_amount < 0 OR discount_amount > quantity * unit_price"
+            )
     return statements, expected_counts
 
 

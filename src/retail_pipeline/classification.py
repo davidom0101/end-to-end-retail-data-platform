@@ -1,4 +1,4 @@
-"""Build warehouse queries that classify incremental v1 rows by source version."""
+"""Build warehouse queries that classify incremental rows by source version."""
 
 from retail_pipeline.manifest import SNAPSHOT_LAYOUTS
 
@@ -17,15 +17,20 @@ def classification_sql(entity: str, core_schema: str) -> str:
     groups.extend(f"OCTET_LENGTH({name})" for name, kind in payload if kind == "string")
     payload_matches = [_matching_column(name, kind) for name, kind in payload]
     selected = [f"incoming.{name}" for name in names]
+    source_fields = names.copy()
     if entity == "order_items":
-        # A missing v1 discount has the same business value as a stored null or zero.
-        payload_matches.append("COALESCE(current_row.discount_amount, 0) = 0")
-        selected.append("CAST(0 AS DECIMAL(12,2)) AS discount_amount")
+        discount = "COALESCE(discount_amount, CAST(0 AS DECIMAL(12,2)))"
+        source_fields.append(f"{discount} AS discount_amount")
+        groups.append(discount)
+        payload_matches.append(
+            "COALESCE(current_row.discount_amount, 0) = incoming.discount_amount"
+        )
+        selected.append("incoming.discount_amount")
 
     return f"""
 CREATE TEMP TABLE classified_{entity} AS
 WITH versions AS (
-    SELECT {", ".join(names)}, COUNT(*) AS occurrences
+    SELECT {", ".join(source_fields)}, COUNT(*) AS occurrences
     FROM stage_{entity}
     GROUP BY {", ".join(groups)}
 ), ranked AS (
