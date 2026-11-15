@@ -1,12 +1,15 @@
 """Select published deliveries before staging or applying data."""
 
 import re
+from base64 import b64encode
 from collections.abc import Iterable
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import date
 from hashlib import sha256
 from typing import BinaryIO, Literal, Protocol, TypedDict
+
+from botocore.exceptions import ClientError
 
 from retail_pipeline.manifest import (
     BATCH_ID_PATTERN,
@@ -34,6 +37,10 @@ class _S3Page(TypedDict, total=False):
     Contents: list[_S3ListedObject]
 
 
+class _S3Checksum(TypedDict, total=False):
+    ChecksumSHA256: str
+
+
 class _S3ObjectPaginator(Protocol):
     def paginate(self, *, Bucket: str, Prefix: str) -> Iterable[_S3Page]: ...
 
@@ -46,6 +53,12 @@ class DeliverySource(SnapshotSource, Protocol):
     def get_paginator(
         self, operation_name: Literal["list_objects_v2"], /
     ) -> _S3ObjectPaginator: ...
+
+
+class VerifiedDeliverySource(DeliverySource, Protocol):
+    def head_object(
+        self, *, Bucket: str, Key: str, ChecksumMode: str
+    ) -> _S3Checksum: ...
 
 
 class DeliverySelectionError(ValueError):
@@ -87,6 +100,27 @@ def read_published_delivery(
     return PublishedDelivery(
         source_manifest_uri, bucket, prefix, delivery, sha256(source_bytes).hexdigest()
     )
+
+
+def verify_delivery_files(
+    s3: VerifiedDeliverySource, published: PublishedDelivery
+) -> None:
+    """Check each listed file against the checksum stored by the publisher."""
+    for file in published.delivery.files:
+        key = f"{published.prefix}/{file.relative_path}"
+        try:
+            metadata = s3.head_object(
+                Bucket=published.bucket, Key=key, ChecksumMode="ENABLED"
+            )
+        except ClientError as exc:
+            raise DeliverySelectionError(
+                f"Cannot verify s3://{published.bucket}/{key}"
+            ) from exc
+        checksum = b64encode(bytes.fromhex(file.sha256)).decode("ascii")
+        if metadata.get("ChecksumSHA256") != checksum:
+            raise DeliverySelectionError(
+                f"SHA-256 mismatch for s3://{published.bucket}/{key}"
+            )
 
 
 def discover_deliveries(

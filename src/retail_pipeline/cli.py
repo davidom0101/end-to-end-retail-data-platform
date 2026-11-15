@@ -56,7 +56,7 @@ def parse_settings(argv: list[str] | None = None) -> PipelineSettings:
         description="Display the pipeline configuration without connecting to AWS.",
         epilog="Commands: validate-manifest, upload-delivery, upload-snapshot, "
         "stage-snapshot, load-snapshot, run-snapshot, discover-deliveries, "
-        "stage-incremental, classify-incremental, apply-incremental.",
+        "stage-incremental, classify-incremental, apply-incremental, run-deliveries.",
     )
     options = (
         ("--dataset-path", "RETAIL_DATASET_PATH", "Local dataset directory"),
@@ -125,6 +125,9 @@ def main() -> None:
         return
     if arguments[:1] == ["apply-incremental"]:
         _apply_incremental_command(arguments[1:])
+        return
+    if arguments[:1] == ["run-deliveries"]:
+        _run_deliveries_command(arguments[1:])
         return
 
     settings = parse_settings(arguments)
@@ -205,7 +208,7 @@ def _stage_snapshot_command(arguments: list[str], *, load_core: bool = False) ->
     parser = argparse.ArgumentParser(
         prog=f"retail-pipeline {command}",
         description=(
-            "Replace the selected demo tables with a published historical snapshot."
+            "Initialize the selected demo tables from a published historical snapshot."
             if load_core
             else "Verify a published historical snapshot through Redshift staging."
         ),
@@ -326,17 +329,41 @@ def _parse_cutoff(value: str) -> date:
     raise argparse.ArgumentTypeError("Cutoff must be a UTC date in YYYY-MM-DD form")
 
 
-def _discover_deliveries_command(arguments: list[str]) -> None:
-    parser = argparse.ArgumentParser(
-        prog="retail-pipeline discover-deliveries",
-        description="Read one published manifest or list normal deliveries in order.",
-    )
+def _add_delivery_selection(parser: argparse.ArgumentParser) -> None:
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("source_manifest_uri", nargs="?")
     selection.add_argument("--through", type=_parse_cutoff, metavar="YYYY-MM-DD")
     parser.add_argument(
         "--dataset-id", help="Dataset release to discover with --through"
     )
+
+
+def _run_deliveries_command(arguments: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="retail-pipeline run-deliveries",
+        description="Apply published deliveries and run dbt.",
+    )
+    _add_delivery_selection(parser)
+    args = parser.parse_args(arguments)
+    if args.through and not args.dataset_id:
+        parser.error("--through requires --dataset-id")
+    if args.source_manifest_uri and args.dataset_id:
+        parser.error("--dataset-id is only used with --through")
+
+    from retail_pipeline.flows import run_deliveries
+
+    results = run_deliveries(
+        args.source_manifest_uri, dataset_id=args.dataset_id, through=args.through
+    )
+    print(json.dumps([asdict(result) for result in results], indent=2))
+
+
+def _discover_deliveries_command(arguments: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="retail-pipeline discover-deliveries",
+        description="Read one published manifest or list normal deliveries in order.",
+    )
+    _add_delivery_selection(parser)
     _add_options(parser, _S3_OPTIONS[:2])
     parser.add_argument("--raw-bucket", default=os.environ.get("RETAIL_RAW_BUCKET"))
     args = parser.parse_args(arguments)

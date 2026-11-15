@@ -1,4 +1,5 @@
 import json
+from base64 import b64encode
 from collections.abc import Iterator
 from hashlib import sha256
 from io import BytesIO
@@ -11,8 +12,11 @@ from prefect.testing.utilities import prefect_test_harness
 
 from retail_pipeline import flows
 from retail_pipeline.cli import main
-from retail_pipeline.discovery import read_published_delivery
+from retail_pipeline.discovery import DeliverySelectionError, read_published_delivery
 from retail_pipeline.staging import (
+    AppliedBatch,
+    AppliedDelivery,
+    LoadedSnapshot,
     SnapshotStagingError,
     load_snapshot,
     stage_incremental,
@@ -26,10 +30,12 @@ COUNTS = {"customers": 800, "products": 50, "orders": 4900, "order_items": 8747}
 
 
 class PublishedObjects:
-    def __init__(self, *, incremental: bool = False) -> None:
+    def __init__(
+        self, *, incremental: bool = False, batch_id: str | None = None
+    ) -> None:
         files = []
         self.objects = {}
-        batch_id = "daily-001" if incremental else "snapshot-001"
+        batch_id = batch_id or ("daily-001" if incremental else "snapshot-001")
         prefix = f"raw/demo-v1/{batch_id}"
         counts = {"orders": 1} if incremental else COUNTS
         for entity, count in counts.items():
@@ -64,6 +70,19 @@ class PublishedObjects:
         assert Bucket == BUCKET
         return {"Body": BytesIO(json.dumps(self.objects[Key]).encode())}
 
+    def get_paginator(self, operation_name: str) -> SimpleNamespace:
+        assert operation_name == "list_objects_v2"
+        return SimpleNamespace(
+            paginate=lambda **_: [
+                {"Contents": [{"Key": key} for key in sorted(self.objects)]}
+            ]
+        )
+
+    def head_object(self, *, Bucket: str, Key: str, ChecksumMode: str) -> dict:
+        assert Bucket == BUCKET and ChecksumMode == "ENABLED"
+        assert Key.endswith(".parquet")
+        return {"ChecksumSHA256": b64encode(bytes.fromhex("a" * 64)).decode("ascii")}
+
 
 class RedshiftBatch:
     def __init__(
@@ -71,7 +90,7 @@ class RedshiftBatch:
         counts: dict[str, int],
         *,
         invalid_ids: int | None = None,
-        core_outcome: str = "loaded",
+        core_outcome: str = "applied",
     ) -> None:
         self.counts = counts
         self.invalid_ids = invalid_ids
@@ -94,6 +113,9 @@ class RedshiftBatch:
             self.core_statements = Sqls
             return {"Id": "core-batch"}
 
+        if "FROM pg_catalog.pg_tables" in Sqls[0]:
+            return {"Id": "ledger-catalog"}
+
         self.statements = Sqls
         return {"Id": "batch-id", "SessionId": "verified-staging-session"}
 
@@ -103,9 +125,11 @@ class RedshiftBatch:
             "SubStatements": [{"Id": f"{Id}:last", "HasResultSet": True}],
         }
 
-    def get_statement_result(self, *, Id: str) -> dict:
+    def get_statement_result(self, *, Id: str, NextToken: str = "") -> dict:
         if Id == "core-batch:last":
             return {"Records": [[{"stringValue": self.core_outcome}]]}
+        if Id == "ledger-catalog:last":
+            return {"Records": [[{"longValue": 0}]]}
         assert Id == "batch-id:last"
         invalid = [] if self.invalid_ids is None else [{"longValue": self.invalid_ids}]
         return {
@@ -226,7 +250,7 @@ def test_core_load_uses_verified_session_and_replaces_only_demo_tables() -> None
 
     assert loaded.row_counts == COUNTS
     assert loaded.core_schema == "core_demo"
-    lock, *mutations, outcome = redshift.core_statements
+    lock, status, *mutations, outcome = redshift.core_statements
     assert lock.startswith("LOCK TABLE core_demo.applied_batches, core_demo.customers,")
     deletes = mutations[:4]
     assert [sql.split()[2] for sql in deletes] == [
@@ -239,16 +263,17 @@ def test_core_load_uses_verified_session_and_replaces_only_demo_tables() -> None
     assert "created_at, 0 FROM stage_customers" in inserts[0]
     assert "0.00 FROM stage_order_items" in inserts[-1]
     for sql in deletes + inserts:
-        assert "WHERE NOT (EXISTS (SELECT 1 FROM core_demo.applied_batches" in sql
-        assert "kind = 'incremental'" in sql
+        assert "WHERE (SELECT status FROM snapshot_status) = 'applied'" in sql
     ledger_insert = mutations[-1]
     assert ledger_insert.startswith("INSERT INTO core_demo.applied_batches")
     assert (
         f"'demo-v1', 'snapshot-001', 'historical', '{checksum}', 800, 50, 4900, 8747"
         in ledger_insert
     )
-    assert "WHERE NOT EXISTS (SELECT 1 FROM core_demo.applied_batches)" in ledger_insert
-    assert "THEN 'daily-applied'" in outcome
+    assert "WHERE (SELECT status FROM snapshot_status) = 'applied'" in ledger_insert
+    assert "THEN 'daily-applied'" in status
+    assert "THEN 'already_applied'" in status
+    assert outcome == "SELECT status FROM snapshot_status"
 
 
 @pytest.mark.parametrize(
@@ -340,7 +365,7 @@ def test_run_snapshot_cli_runs_dbt_only_after_verified_core_load(
     process.wait.return_value = 1 if failure == "dbt" else 0
 
     def start_dbt(command: list[str], **kwargs: object) -> MagicMock:
-        assert redshift.core_statements[1].startswith(
+        assert redshift.core_statements[2].startswith(
             "DELETE FROM core_demo_flow.order_items WHERE "
         )
         assert command[:5] == [
@@ -372,3 +397,108 @@ def test_run_snapshot_cli_runs_dbt_only_after_verified_core_load(
     else:
         main()
         fake_subprocess.Popen.assert_called_once()
+
+
+@pytest.mark.usefixtures("prefect_server")
+@pytest.mark.parametrize(
+    "scenario", ["fresh", "resume", "changed-manifest", "changed-file"]
+)
+def test_run_deliveries_gates_warehouse_writes_and_dbt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    scenario: str,
+) -> None:
+    project_dir = tmp_path / "dbt"
+    project_dir.mkdir()
+    (project_dir / "dbt_project.yml").touch()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    monkeypatch.setenv("RETAIL_RAW_BUCKET", BUCKET)
+    monkeypatch.setenv("RETAIL_REDSHIFT_WORKGROUP", "retail-dev")
+    monkeypatch.setenv("RETAIL_REDSHIFT_DATABASE", "retail")
+    monkeypatch.setenv("RETAIL_CORE_SCHEMA", "core_demo_flow")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "retail-pipeline",
+            "run-deliveries",
+            "--dataset-id",
+            "demo-v1",
+            "--through",
+            "2026-11-10",
+        ],
+    )
+
+    s3 = PublishedObjects()
+    for batch in ("daily-002", "daily-001", "late-001"):
+        s3.objects.update(PublishedObjects(incremental=True, batch_id=batch).objects)
+    ledger = {}
+    if scenario != "fresh":
+        for batch in ("snapshot-001", "daily-001"):
+            published = read_published_delivery(
+                s3, f"s3://{BUCKET}/raw/demo-v1/{batch}/manifest.json"
+            )
+            ledger[("demo-v1", batch)] = AppliedBatch(
+                published.delivery.kind, published.manifest_sha256
+            )
+    daily_key = "raw/demo-v1/daily-001/manifest.json"
+    if scenario == "changed-manifest":
+        s3.objects[daily_key]["files"][0]["row_count"] = 2
+    if scenario == "changed-file":
+        original_head = s3.head_object
+        monkeypatch.setattr(
+            s3,
+            "head_object",
+            lambda **kwargs: (
+                {} if "/daily-001/" in kwargs["Key"] else original_head(**kwargs)
+            ),
+        )
+
+    monkeypatch.setattr(s3, "close", lambda: None, raising=False)
+    clients = {"s3": s3, "redshift-data": SimpleNamespace(close=lambda: None)}
+    monkeypatch.setattr(
+        flows.boto3, "Session", lambda **_: SimpleNamespace(client=clients.__getitem__)
+    )
+    monkeypatch.setattr(flows, "read_applied_batches", lambda *args, **kwargs: ledger)
+
+    events = []
+
+    def snapshot(*args: object, **kwargs: object) -> LoadedSnapshot:
+        events.append("snapshot-001")
+        return LoadedSnapshot(SOURCE_URI, "core_demo_flow", COUNTS)
+
+    def incremental(s3, redshift, published, **kwargs):
+        events.append(published.delivery.batch_id)
+        return AppliedDelivery("applied", {"orders": {"insert": 1}})
+
+    monkeypatch.setattr(flows, "_apply_snapshot", snapshot)
+    monkeypatch.setattr(flows, "_apply_incremental", incremental)
+    monkeypatch.setattr(flows, "_build_mart", lambda *args: events.append("dbt"))
+
+    if scenario == "changed-manifest":
+        with pytest.raises(SnapshotStagingError, match="has a different manifest"):
+            main()
+        assert events == []
+    elif scenario == "changed-file":
+        with pytest.raises(DeliverySelectionError, match="SHA-256 mismatch"):
+            main()
+        assert events == []
+    else:
+        main()
+        result = json.loads(capsys.readouterr().out)
+        assert [row["batch_id"] for row in result] == [
+            "snapshot-001",
+            "daily-001",
+            "daily-002",
+        ]
+        if scenario == "fresh":
+            assert events == ["snapshot-001", "daily-001", "daily-002", "dbt"]
+            assert [row["status"] for row in result] == ["applied"] * 3
+        else:
+            assert events == ["daily-002", "dbt"]
+            assert [row["status"] for row in result] == [
+                "already_applied",
+                "already_applied",
+                "applied",
+            ]
