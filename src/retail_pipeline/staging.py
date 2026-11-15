@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from time import monotonic, sleep
 from typing import Protocol, TypedDict
 
+from retail_pipeline.application import application_statements, lock_core_sql
 from retail_pipeline.classification import (
+    CLASSIFICATION_DECISIONS,
     classification_sql,
     classification_summary_sql,
 )
@@ -86,6 +88,12 @@ class LoadedSnapshot:
     row_counts: dict[str, int]
 
 
+@dataclass(frozen=True)
+class AppliedDelivery:
+    status: str
+    counts: dict[str, dict[str, int]]
+
+
 def read_published_snapshot(
     s3: SnapshotSource, source_manifest_uri: str
 ) -> PublishedDelivery:
@@ -143,11 +151,9 @@ def classify_incremental(
 ) -> dict[str, dict[str, int]]:
     """Stage a v1 delivery, then preview its decisions against an existing target."""
     _validate_core_schema(core_schema)
-    counts, session_id = _stage_incremental(
-        s3, redshift, published, workgroup=workgroup, database=database, keep_alive=60
+    counts, session_id = _stage_incremental_for_core(
+        s3, redshift, published, workgroup=workgroup, database=database
     )
-    if not session_id:
-        raise SnapshotStagingError("Redshift did not return the staging session ID")
 
     statements = [classification_sql(entity, core_schema) for entity in counts]
     statements.append(classification_summary_sql(counts))
@@ -158,12 +164,60 @@ def classify_incremental(
     return _read_classification(rows, counts)
 
 
+def apply_incremental(
+    s3: SnapshotSource,
+    redshift: RedshiftClient,
+    published: PublishedDelivery,
+    *,
+    workgroup: str,
+    database: str,
+    core_schema: str,
+) -> AppliedDelivery:
+    """Apply one published v1 delivery after validating it in a locked transaction."""
+    _validate_core_schema(core_schema)
+    _validate_manifest_identity(
+        published.delivery.dataset_id,
+        published.delivery.batch_id,
+        published.manifest_sha256,
+    )
+    counts, session_id = _stage_incremental_for_core(
+        s3, redshift, published, workgroup=workgroup, database=database
+    )
+    batch = redshift.batch_execute_statement(
+        Sqls=application_statements(core_schema, published, counts),
+        SessionId=session_id,
+        SessionKeepAliveSeconds=0,
+    )
+    rows = _last_batch_result(redshift, batch["Id"])
+    status_rows = [row for row in rows if row[0]["stringValue"] == "_batch"]
+    if len(status_rows) != 1:
+        raise SnapshotStagingError("Missing incremental application outcome")
+    status = status_rows[0][1]["stringValue"]
+    if status == "already_applied":
+        return AppliedDelivery(status, {})
+    errors = {
+        "snapshot_required": "Apply the snapshot before incremental deliveries",
+        "wrong_dataset": "Incremental delivery and target dataset do not match",
+        "changed_batch": "Applied batch key has a different manifest or delivery kind",
+    }
+    if status in errors:
+        raise SnapshotStagingError(errors[status])
+    if status not in ("applied", "rejected"):
+        raise SnapshotStagingError(
+            f"Unexpected incremental application outcome: {status!r}"
+        )
+    details = [row for row in rows if row[0]["stringValue"] != "_batch"]
+    summary = _read_classification(details, counts)
+    if status == "rejected":
+        raise SnapshotStagingError("Incremental application rejected")
+    return AppliedDelivery(status, summary)
+
+
 def _read_classification(
     rows: list[list[dict[str, str | int]]], staged_counts: dict[str, int]
 ) -> dict[str, dict[str, int]]:
     summary = {
-        entity: dict.fromkeys(("insert", "update", "duplicate", "stale"), 0)
-        for entity in staged_counts
+        entity: dict.fromkeys(CLASSIFICATION_DECISIONS, 0) for entity in staged_counts
     }
     errors = {
         "conflict_in_delivery": "Version conflict within the delivery",
@@ -171,10 +225,17 @@ def _read_classification(
         "invalid_version": "Invalid source version",
         "invalid_core_version": "Invalid core version",
         "duplicate_core_key": "Duplicate business key in core",
+        "missing_customer_id": "Missing customer reference",
+        "missing_order_id": "Missing order reference",
+        "missing_product_id": "Missing product reference",
     }
     for entity_cell, decision_cell, versions, repeated, sample in rows:
         entity = str(entity_cell["stringValue"])
         decision = str(decision_cell["stringValue"])
+        if decision == "classification_count_mismatch":
+            raise SnapshotStagingError(
+                f"Classification counts differ from staging for {entity}"
+            )
         if decision in errors:
             raise SnapshotStagingError(
                 f"{errors[decision]} for {entity} key {sample['stringValue']!r}"
@@ -192,6 +253,22 @@ def _read_classification(
     if classified_counts != staged_counts:
         raise SnapshotStagingError("Classification counts differ from verified staging")
     return summary
+
+
+def _stage_incremental_for_core(
+    s3: SnapshotSource,
+    redshift: RedshiftClient,
+    published: PublishedDelivery,
+    *,
+    workgroup: str,
+    database: str,
+) -> tuple[dict[str, int], str]:
+    counts, session_id = _stage_incremental(
+        s3, redshift, published, workgroup=workgroup, database=database, keep_alive=60
+    )
+    if not session_id:
+        raise SnapshotStagingError("Redshift did not return the staging session ID")
+    return counts, session_id
 
 
 def _stage_incremental(
@@ -306,16 +383,11 @@ def commit_snapshot_load(
         staged.batch_id,
         staged.manifest_sha256,
     )
-    if not (
-        re.fullmatch(BATCH_ID_PATTERN, dataset_id)
-        and re.fullmatch(BATCH_ID_PATTERN, batch_id)
-        and re.fullmatch(r"[0-9a-f]{64}", checksum)
-    ):
-        raise SnapshotStagingError("Invalid staged manifest identity")
+    _validate_manifest_identity(dataset_id, batch_id, checksum)
     ledger = f"{core_schema}.applied_batches"
     tables = [f"{core_schema}.{entity}" for entity in SNAPSHOT_LAYOUTS]
     # Read the ledger only after taking the locks used to serialize applications.
-    statements = [f"LOCK TABLE {', '.join([ledger, *tables])}"]
+    statements = [lock_core_sql(core_schema)]
     has_daily = f"EXISTS (SELECT 1 FROM {ledger} WHERE kind = 'incremental')"
     has_other_snapshot = (
         f"EXISTS (SELECT 1 FROM {ledger} WHERE dataset_id <> '{dataset_id}' "
@@ -374,6 +446,15 @@ def commit_snapshot_load(
     return LoadedSnapshot(
         staged.snapshot.source_manifest_uri, core_schema, staged.snapshot.row_counts
     )
+
+
+def _validate_manifest_identity(dataset_id: str, batch_id: str, checksum: str) -> None:
+    if not (
+        re.fullmatch(BATCH_ID_PATTERN, dataset_id)
+        and re.fullmatch(BATCH_ID_PATTERN, batch_id)
+        and re.fullmatch(r"[0-9a-f]{64}", checksum)
+    ):
+        raise SnapshotStagingError("Invalid staged manifest identity")
 
 
 def _validate_core_schema(core_schema: str) -> None:

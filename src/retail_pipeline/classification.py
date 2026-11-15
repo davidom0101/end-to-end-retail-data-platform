@@ -3,6 +3,8 @@
 from retail_pipeline.manifest import SNAPSHOT_LAYOUTS
 
 _VERSION_NAMES = ("updated_at", "source_sequence")
+ACCEPTED_DECISIONS = ("insert", "update")
+CLASSIFICATION_DECISIONS = (*ACCEPTED_DECISIONS, "duplicate", "stale")
 
 
 def classification_sql(entity: str, core_schema: str) -> str:
@@ -65,9 +67,13 @@ SELECT {", ".join(selected)}, incoming.occurrences,
        END AS decision
 FROM ranked AS incoming
 LEFT JOIN current_state AS current_row
-  ON incoming.{key} = current_row.{key}
- AND OCTET_LENGTH(incoming.{key}) = OCTET_LENGTH(current_row.{key})
+  ON {same_key_sql(f"incoming.{key}", f"current_row.{key}")}
 """.strip()
+
+
+def same_key_sql(left: str, right: str) -> str:
+    """Compare opaque IDs without losing trailing spaces in Redshift."""
+    return f"{left} = {right} AND OCTET_LENGTH({left}) = OCTET_LENGTH({right})"
 
 
 def _matching_column(name: str, kind: str) -> str:

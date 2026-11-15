@@ -17,9 +17,11 @@ from retail_pipeline.discovery import (
     read_published_delivery,
 )
 from retail_pipeline.staging import (
+    AppliedDelivery,
     LoadedSnapshot,
     RedshiftClient,
     StagedSnapshotLoad,
+    apply_incremental,
     classify_incremental,
     commit_snapshot_load,
     read_published_snapshot,
@@ -189,6 +191,24 @@ def run_incremental_classification(
     with _runner_clients() as (s3, redshift):
         published = _read_manifest(s3, source_manifest_uri)
         return classify_incremental(
+            s3,
+            redshift,
+            published,
+            workgroup=workgroup,
+            database=database,
+            core_schema=core_schema,
+        )
+
+
+@flow(name="incremental-application", persist_result=False)
+def run_incremental_application(source_manifest_uri: str) -> AppliedDelivery:
+    """Apply one explicitly selected incremental delivery."""
+    workgroup = _required_env("RETAIL_REDSHIFT_WORKGROUP")
+    database = _required_env("RETAIL_REDSHIFT_DATABASE")
+    core_schema = _required_env("RETAIL_CORE_SCHEMA")
+    with _runner_clients() as (s3, redshift):
+        published = _read_manifest(s3, source_manifest_uri)
+        return apply_incremental(
             s3,
             redshift,
             published,
