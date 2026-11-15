@@ -28,7 +28,11 @@ def lock_core_sql(core_schema: str) -> str:
 
 
 def application_statements(
-    core_schema: str, published: PublishedDelivery, counts: dict[str, int]
+    core_schema: str,
+    published: PublishedDelivery,
+    counts: dict[str, int],
+    *,
+    fail_before_commit: bool = False,
 ) -> list[str]:
     """Build one transaction for a validated schema, manifest, and staged counts."""
     ledger = f"{core_schema}.applied_batches"
@@ -65,21 +69,27 @@ END AS status
             statements.extend(_write_entity_sql(core_schema, entity))
 
     row_counts = ", ".join(str(counts.get(entity, 0)) for entity in SNAPSHOT_LAYOUTS)
-    statements.extend(
-        [
-            f"INSERT INTO {ledger} (dataset_id, batch_id, kind, manifest_sha256, "
-            "customer_rows, product_rows, order_rows, order_item_rows) "
-            f"SELECT '{dataset_id}', '{batch_id}', 'incremental', '{checksum}', "
-            f"{row_counts} WHERE {_CAN_APPLY}",
-            "SELECT '_batch' AS entity, CASE "
-            "WHEN status = 'ready' AND EXISTS (SELECT 1 FROM apply_errors) "
-            "THEN 'rejected' WHEN status = 'ready' THEN 'applied' ELSE status END "
-            "AS decision, CAST(0 AS BIGINT) AS versions, "
-            "CAST(0 AS BIGINT) AS repeated, "
-            "CAST('' AS VARCHAR(65535)) AS sample_key FROM apply_status "
-            f"UNION ALL SELECT * FROM apply_errors WHERE {_READY} "
-            f"UNION ALL SELECT * FROM apply_summary WHERE {_CAN_APPLY}",
-        ]
+    statements.append(
+        f"INSERT INTO {ledger} (dataset_id, batch_id, kind, manifest_sha256, "
+        "customer_rows, product_rows, order_rows, order_item_rows) "
+        f"SELECT '{dataset_id}', '{batch_id}', 'incremental', '{checksum}', "
+        f"{row_counts} WHERE {_CAN_APPLY}"
+    )
+    if fail_before_commit:
+        # Fail a separate statement after the core and ledger inserts have run.
+        statements.append(
+            f"SELECT CAST(CASE WHEN {_CAN_APPLY} THEN 'injected-before-commit' "
+            "ELSE '0' END AS INTEGER) FROM apply_status"
+        )
+    statements.append(
+        "SELECT '_batch' AS entity, CASE "
+        "WHEN status = 'ready' AND EXISTS (SELECT 1 FROM apply_errors) "
+        "THEN 'rejected' WHEN status = 'ready' THEN 'applied' ELSE status END "
+        "AS decision, CAST(0 AS BIGINT) AS versions, "
+        "CAST(0 AS BIGINT) AS repeated, "
+        "CAST('' AS VARCHAR(65535)) AS sample_key FROM apply_status "
+        f"UNION ALL SELECT * FROM apply_errors WHERE {_READY} "
+        f"UNION ALL SELECT * FROM apply_summary WHERE {_CAN_APPLY}"
     )
     return statements
 

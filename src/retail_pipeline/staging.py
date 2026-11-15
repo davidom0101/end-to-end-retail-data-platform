@@ -256,6 +256,7 @@ def apply_incremental(
     workgroup: str,
     database: str,
     core_schema: str,
+    fail_before_commit: bool = False,
 ) -> AppliedDelivery:
     """Apply one published v1 delivery after validating it in a locked transaction."""
     _validate_core_schema(core_schema)
@@ -269,7 +270,9 @@ def apply_incremental(
     )
     rows = _run_core_batch(
         redshift,
-        application_statements(core_schema, published, counts),
+        application_statements(
+            core_schema, published, counts, fail_before_commit=fail_before_commit
+        ),
         session_id,
         batch_key=(published.delivery.dataset_id, published.delivery.batch_id),
         expected=AppliedBatch("incremental", published.manifest_sha256),

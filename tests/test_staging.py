@@ -1,6 +1,7 @@
 import json
 from base64 import b64encode
 from collections.abc import Iterator
+from contextlib import nullcontext
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
@@ -510,6 +511,84 @@ def test_prefect_rejects_incremental_version_conflict_without_retry(
             core_schema="core_demo",
         )
     assert sum("SessionId" in call.kwargs for call in submit.call_args_list) == 1
+
+
+def test_before_commit_injects_sql_after_core_and_ledger_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s3 = PublishedObjects(incremental=True)
+    uri = f"s3://{BUCKET}/raw/demo-v1/daily-001/manifest.json"
+    published = read_published_delivery(s3, uri)
+    redshift = RedshiftBatch({"orders": 1}, invalid_ids=0)
+    original_describe = redshift.describe_statement
+
+    def describe(*, Id: str) -> dict:
+        if Id == "core-batch":
+            return {"Status": "FAILED", "Error": "injected-before-commit"}
+        return original_describe(Id=Id)
+
+    monkeypatch.setattr(redshift, "describe_statement", describe)
+    with pytest.raises(SnapshotStagingError, match="injected-before-commit"):
+        staging.apply_incremental(
+            s3,
+            redshift,
+            published,
+            workgroup="retail-dev",
+            database="retail",
+            core_schema="core_demo",
+            fail_before_commit=True,
+        )
+
+    order_insert, ledger_insert, injected_error, outcome = redshift.core_statements[-4:]
+    assert order_insert.startswith("INSERT INTO core_demo.orders")
+    assert ledger_insert.startswith("INSERT INTO core_demo.applied_batches")
+    assert "injected-before-commit" in injected_error
+    assert outcome.startswith("SELECT '_batch'")
+
+
+@pytest.mark.usefixtures("prefect_server")
+@pytest.mark.parametrize(
+    ("point", "message", "expected_events"),
+    [
+        ("before-core", "Injected failure before core writes", []),
+        ("before-commit", "injected-before-commit", ["rollback"]),
+        ("after-commit", "Injected failure after core commit", ["commit"]),
+    ],
+)
+def test_delivery_cli_injects_failure_without_running_dbt(
+    point: str,
+    message: str,
+    expected_events: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s3 = PublishedObjects(incremental=True)
+    uri = f"s3://{BUCKET}/raw/demo-v1/daily-001/manifest.json"
+    redshift = RedshiftBatch({"orders": 1})
+    monkeypatch.setattr(flows, "_runner_clients", lambda: nullcontext((s3, redshift)))
+    monkeypatch.setattr(flows, "_dbt_project", lambda: Path("dbt"))
+    monkeypatch.setenv("RETAIL_REDSHIFT_WORKGROUP", "retail-dev")
+    monkeypatch.setenv("RETAIL_REDSHIFT_DATABASE", "retail")
+    monkeypatch.setenv("RETAIL_CORE_SCHEMA", "core_demo")
+    monkeypatch.setattr(
+        "sys.argv",
+        ["retail-pipeline", "run-deliveries", uri, "--inject-failure", point],
+    )
+    events = []
+
+    def apply(*args, fail_before_commit: bool, **kwargs) -> AppliedDelivery:
+        if fail_before_commit:
+            events.append("rollback")
+            raise SnapshotStagingError("injected-before-commit")
+        events.append("commit")
+        return AppliedDelivery("applied", {"orders": {"insert": 1}})
+
+    monkeypatch.setattr(flows, "apply_incremental", apply)
+    monkeypatch.setattr(flows, "_build_mart", lambda *args: events.append("dbt"))
+
+    expected_error = SnapshotStagingError if point == "before-commit" else RuntimeError
+    with pytest.raises(expected_error, match=message):
+        main()
+    assert events == expected_events
 
 
 @pytest.mark.usefixtures("prefect_server")

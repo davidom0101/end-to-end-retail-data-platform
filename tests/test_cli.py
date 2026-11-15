@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from retail_pipeline.cli import parse_settings
+from retail_pipeline.cli import main, parse_settings
 
 
 def test_cli_overrides_environment_and_uses_aws_region_fallback(
@@ -27,3 +27,25 @@ def test_cli_overrides_environment_and_uses_aws_region_fallback(
     assert settings.aws_region == "eu-west-1"
     assert settings.redshift_workgroup == "retail-dev"
     assert settings.redshift_database == "retail"
+
+
+def test_failure_injection_requires_exact_manifest(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "retail-pipeline",
+            "run-deliveries",
+            "--through",
+            "2026-11-12",
+            "--dataset-id",
+            "demo-v1",
+            "--inject-failure",
+            "before-core",
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+    assert "requires an exact incremental manifest URI" in capsys.readouterr().err

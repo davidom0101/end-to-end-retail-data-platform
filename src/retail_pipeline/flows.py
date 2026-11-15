@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import date
+from enum import StrEnum
 from pathlib import Path
 from typing import TypedDict, cast
 from uuid import uuid4
@@ -51,6 +52,12 @@ class DeliveryRun:
     batch_id: str
     status: str
     counts: dict[str, dict[str, int]]
+
+
+class FailurePoint(StrEnum):
+    BEFORE_CORE = "before-core"
+    BEFORE_COMMIT = "before-commit"
+    AFTER_COMMIT = "after-commit"
 
 
 def _retry_transient_failure(_task: object, _run: object, state: State) -> bool:
@@ -167,6 +174,7 @@ def _apply_incremental(
     workgroup: str,
     database: str,
     core_schema: str,
+    fail_before_commit: bool = False,
 ) -> AppliedDelivery:
     return apply_incremental(
         s3,
@@ -175,6 +183,7 @@ def _apply_incremental(
         workgroup=workgroup,
         database=database,
         core_schema=core_schema,
+        fail_before_commit=fail_before_commit,
     )
 
 
@@ -387,8 +396,11 @@ def run_deliveries(
     *,
     dataset_id: str | None = None,
     through: date | None = None,
+    inject_failure: FailurePoint | None = None,
 ) -> list[DeliveryRun]:
     """Process one published delivery or all normal deliveries through a cutoff."""
+    if inject_failure is not None and source_manifest_uri is None:
+        raise ValueError("Failure injection requires an exact incremental manifest URI")
     if source_manifest_uri is not None:
         if dataset_id is not None or through is not None:
             raise ValueError("Choose an S3 manifest URI or a dataset and cutoff")
@@ -415,7 +427,18 @@ def run_deliveries(
         for published in deliveries:
             delivery = published.delivery
             key = (delivery.dataset_id, delivery.batch_id)
-            if _verified_replay(s3, published, ledger.get(key)):
+            replay = _verified_replay(s3, published, ledger.get(key))
+            if inject_failure is not None:
+                if delivery.kind != "incremental" or replay:
+                    raise ValueError(
+                        "Failure injection requires a pending incremental delivery"
+                    )
+                get_run_logger().info(
+                    "Injecting %s failure for %s/%s", inject_failure, *key
+                )
+            if inject_failure == FailurePoint.BEFORE_CORE:
+                raise RuntimeError("Injected failure before core writes")
+            if replay:
                 result = AppliedDelivery("already_applied", {})
             elif delivery.kind == "historical":
                 loaded = _apply_snapshot(
@@ -440,10 +463,17 @@ def run_deliveries(
                     workgroup=workgroup,
                     database=database,
                     core_schema=core_schema,
+                    fail_before_commit=inject_failure == FailurePoint.BEFORE_COMMIT,
                 )
+                if inject_failure is not None and result.status == "already_applied":
+                    raise ValueError(
+                        "Failure injection requires a pending incremental delivery"
+                    )
             get_run_logger().info(
                 "Delivery %s/%s %s: %s", *key, result.status, result.counts
             )
+            if inject_failure == FailurePoint.AFTER_COMMIT:
+                raise RuntimeError("Injected failure after core commit, before dbt")
             runs.append(DeliveryRun(*key, result.status, result.counts))
 
     _build_mart(core_schema, project_dir)

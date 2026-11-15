@@ -339,21 +339,33 @@ def _add_delivery_selection(parser: argparse.ArgumentParser) -> None:
 
 
 def _run_deliveries_command(arguments: list[str]) -> None:
+    from retail_pipeline.flows import FailurePoint, run_deliveries
+
     parser = argparse.ArgumentParser(
         prog="retail-pipeline run-deliveries",
         description="Apply published deliveries and run dbt.",
     )
     _add_delivery_selection(parser)
+    parser.add_argument(
+        "--inject-failure",
+        type=FailurePoint,
+        choices=list(FailurePoint),
+        help="Demo only. Fail one pending incremental delivery selected by URI.",
+    )
     args = parser.parse_args(arguments)
     if args.through and not args.dataset_id:
         parser.error("--through requires --dataset-id")
     if args.source_manifest_uri and args.dataset_id:
         parser.error("--dataset-id is only used with --through")
 
-    from retail_pipeline.flows import run_deliveries
+    if args.inject_failure and not args.source_manifest_uri:
+        parser.error("--inject-failure requires an exact incremental manifest URI")
 
     results = run_deliveries(
-        args.source_manifest_uri, dataset_id=args.dataset_id, through=args.through
+        args.source_manifest_uri,
+        dataset_id=args.dataset_id,
+        through=args.through,
+        inject_failure=args.inject_failure,
     )
     print(json.dumps([asdict(result) for result in results], indent=2))
 
