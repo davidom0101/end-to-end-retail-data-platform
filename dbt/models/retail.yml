@@ -4,10 +4,66 @@ sources:
   - name: core
     schema: "{{ var('core_schema', 'core_demo') }}"
     tables:
+      - name: customers
+      - name: products
       - name: orders
       - name: order_items
 
 models:
+  - name: dim_customers
+    description: One row per current customer, keyed by customer_id.
+    columns:
+      - name: customer_id
+        data_tests: [unique, not_null]
+  - name: dim_products
+    description: One row per current product, keyed by product_id. Category is the current catalog category.
+    columns:
+      - name: product_id
+        data_tests: [unique, not_null]
+  - name: dim_date
+    description: One row per UTC calendar date between the earliest and latest order date.
+    columns:
+      - name: date_day
+        data_tests: [unique, not_null]
+  - name: fct_orders
+    description: One row per order. The UTC order date determines its reporting day. Net order amount is the sum of its purchase-time net line amounts.
+    columns:
+      - name: order_id
+        data_tests: [unique, not_null]
+      - name: customer_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments: {to: "ref('dim_customers')", field: customer_id}
+      - name: order_date
+        data_tests:
+          - not_null
+          - relationships:
+              arguments: {to: "ref('dim_date')", field: date_day}
+      - name: status
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments: {values: ['pending', 'paid', 'shipped', 'delivered', 'canceled']}
+      - name: net_order_amount
+        data_tests: [not_null]
+  - name: fct_order_items
+    description: One row per order item. Net line amount is quantity times the purchase-time unit price less the effective discount.
+    columns:
+      - name: item_id
+        data_tests: [unique, not_null]
+      - name: order_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments: {to: "ref('fct_orders')", field: order_id}
+      - name: product_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments: {to: "ref('dim_products')", field: product_id}
+      - name: net_line_amount
+        data_tests: [not_null]
   - name: mart_daily_sales_candidate
     description: Net sales in EUR by UTC order date for paid, shipped, and delivered orders.
     columns:
@@ -18,3 +74,22 @@ models:
           - not_null
       - name: net_sales
         description: Sum of item prices times quantity, less item discounts, in EUR.
+        data_tests: [not_null]
+      - name: order_count
+        description: Number of eligible orders on the UTC order date.
+      - name: average_order_value
+        description: Net sales divided by the number of eligible orders on that day, in EUR.
+  - name: mart_product_performance_candidate
+    description: One row per product. Rank by net sales and sum by current category. Includes units and distinct eligible orders.
+    columns:
+      - name: product_id
+        data_tests: [unique, not_null]
+      - name: net_sales
+        data_tests: [not_null]
+  - name: mart_customer_activity_candidate
+    description: One row per customer. Customers with two or more eligible orders are repeat buyers.
+    columns:
+      - name: customer_id
+        data_tests: [unique, not_null]
+      - name: net_sales
+        data_tests: [not_null]

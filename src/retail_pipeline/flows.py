@@ -236,9 +236,9 @@ def _build_mart(
     with audit_stage(audit, "dbt_build", batch_keys):
         _run_dbt(["build"], project_dir, variables)
     with audit_stage(audit, "reporting_publication", batch_keys) as outcome:
-        _run_dbt(["run-operation", "publish_daily_sales"], project_dir, variables)
+        _run_dbt(["run-operation", "publish_retail_marts"], project_dir, variables)
         outcome.status = "published"
-    get_run_logger().info("Published the validated mart_daily_sales view")
+    get_run_logger().info("Published the validated retail marts")
 
 
 def _run_dbt(

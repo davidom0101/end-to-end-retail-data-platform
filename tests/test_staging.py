@@ -758,7 +758,7 @@ def test_run_snapshot_cli_publishes_only_after_core_load_and_dbt_build(
             candidate_vars.update(variables)
             process.wait.return_value = int(failure == "build")
         else:
-            assert arguments == ["run-operation", "publish_daily_sales"]
+            assert arguments == ["run-operation", "publish_retail_marts"]
             assert variables == candidate_vars
             process.wait.return_value = int(failure == "publish")
         return process
@@ -785,11 +785,11 @@ def test_run_snapshot_cli_publishes_only_after_core_load_and_dbt_build(
         assert redshift.audit_records[-1]["status"] == "failed"
     else:
         if failure == "publish":
-            with pytest.raises(RuntimeError, match="publish_daily_sales failed"):
+            with pytest.raises(RuntimeError, match="publish_retail_marts failed"):
                 main()
         else:
             main()
-        assert commands == [["build"], ["run-operation", "publish_daily_sales"]]
+        assert commands == [["build"], ["run-operation", "publish_retail_marts"]]
         assert redshift.audit_records[-3]["status"] == "committed"
         assert redshift.audit_records[-1]["stage"] == "reporting_publication"
         assert redshift.audit_records[-1]["status"] == (
