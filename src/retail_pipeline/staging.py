@@ -331,10 +331,6 @@ def _read_classification(
         "invalid_version": "Invalid source version",
         "invalid_core_version": "Invalid core version",
         "duplicate_core_key": "Duplicate business key in core",
-        "missing_customer_id": "Missing customer reference",
-        "missing_order_id": "Missing order reference",
-        "missing_product_id": "Missing product reference",
-        "invalid_discount": "Discount is outside the line amount",
     }
     for entity_cell, decision_cell, versions, repeated, sample in rows:
         entity = str(entity_cell["stringValue"])
@@ -347,6 +343,9 @@ def _read_classification(
             raise SnapshotStagingError(
                 f"{errors[decision]} for {entity} key {sample['stringValue']!r}"
             )
+        if entity in summary and decision == "quarantined":
+            summary[entity][decision] = int(versions["longValue"])
+            continue
         if entity not in summary or decision not in summary[entity]:
             raise SnapshotStagingError(
                 f"Unexpected classification: {entity} {decision}"
@@ -397,7 +396,7 @@ def _stage_incremental(
         count_queries.append(
             f"SELECT '{entity}' AS entity, COUNT(*) AS row_count, "
             "COUNT(CASE WHEN entity_type IS NULL OR record_id IS NULL "
-            f"OR {business_key} IS NULL OR entity_type <> '{entity}' "
+            f"OR entity_type <> '{entity}' "
             f"OR OCTET_LENGTH(entity_type) <> {len(entity)} "
             f"OR record_id <> {business_key} "
             f"OR OCTET_LENGTH(record_id) <> OCTET_LENGTH({business_key}) "

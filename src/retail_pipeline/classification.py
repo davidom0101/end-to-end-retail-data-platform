@@ -7,7 +7,9 @@ ACCEPTED_DECISIONS = ("insert", "update")
 CLASSIFICATION_DECISIONS = (*ACCEPTED_DECISIONS, "duplicate", "stale")
 
 
-def classification_sql(entity: str, core_schema: str) -> str:
+def classification_sql(
+    entity: str, core_schema: str, *, validated: bool = False
+) -> str:
     """Create a temporary relation with the payload and decision for each version."""
     key = SNAPSHOT_LAYOUTS[entity][0][0]
     payload = SNAPSHOT_LAYOUTS[entity][1:]
@@ -18,6 +20,11 @@ def classification_sql(entity: str, core_schema: str) -> str:
     payload_matches = [_matching_column(name, kind) for name, kind in payload]
     selected = [f"incoming.{name}" for name in names]
     source_fields = names.copy()
+    source = (
+        f"validated_{entity} WHERE rejection_reason IS NULL"
+        if validated
+        else f"stage_{entity}"
+    )
     if entity == "order_items":
         discount = "COALESCE(discount_amount, CAST(0 AS DECIMAL(12,2)))"
         source_fields.append(f"{discount} AS discount_amount")
@@ -31,7 +38,7 @@ def classification_sql(entity: str, core_schema: str) -> str:
 CREATE TEMP TABLE classified_{entity} AS
 WITH versions AS (
     SELECT {", ".join(source_fields)}, COUNT(*) AS occurrences
-    FROM stage_{entity}
+    FROM {source}
     GROUP BY {", ".join(groups)}
 ), ranked AS (
     SELECT versions.*,

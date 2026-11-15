@@ -1,7 +1,6 @@
 """Build the locked Redshift transaction for one staged incremental delivery."""
 
 from retail_pipeline.classification import (
-    ACCEPTED_DECISIONS,
     CLASSIFICATION_DECISIONS,
     classification_sql,
     classification_summary_sql,
@@ -9,12 +8,8 @@ from retail_pipeline.classification import (
 )
 from retail_pipeline.discovery import PublishedDelivery
 from retail_pipeline.manifest import SNAPSHOT_LAYOUTS
+from retail_pipeline.quarantine import quarantine_insert_sql, validate_rows_sql
 
-_REFERENCES = {
-    "orders": (("customer_id", "customers"),),
-    "order_items": (("order_id", "orders"), ("product_id", "products")),
-}
-_ACCEPTED = ", ".join(f"'{decision}'" for decision in ACCEPTED_DECISIONS)
 _DECISIONS = ", ".join(f"'{decision}'" for decision in CLASSIFICATION_DECISIONS)
 _READY = "(SELECT status FROM apply_status) = 'ready'"
 _CAN_APPLY = f"{_READY} AND NOT EXISTS (SELECT 1 FROM apply_errors)"
@@ -59,11 +54,35 @@ SELECT CASE
 END AS status
 """.strip(),
     ]
-    statements.extend(classification_sql(entity, core_schema) for entity in counts)
+    for entity in SNAPSHOT_LAYOUTS:
+        if entity in counts:
+            statements.append(validate_rows_sql(entity, core_schema, counts))
+            statements.append(classification_sql(entity, core_schema, validated=True))
     statements.append(
         f"CREATE TEMP TABLE apply_summary AS {classification_summary_sql(counts)}"
     )
     statements.append(_validation_sql(core_schema, counts))
+    statements.append(
+        f"CREATE TABLE IF NOT EXISTS {core_schema}.quarantined_events ("
+        "dataset_id VARCHAR(1024), batch_id VARCHAR(1024), entity_type VARCHAR(16), "
+        "event_id VARCHAR(65535), record_id VARCHAR(65535), reason VARCHAR(64), "
+        "source_payload SUPER)"
+    )
+    has_discount = any(
+        file.entity_type == "order_items" and file.schema_version == 2
+        for file in published.delivery.files
+    )
+    for entity in counts:
+        statements.append(
+            quarantine_insert_sql(
+                core_schema,
+                entity,
+                dataset_id,
+                batch_id,
+                _CAN_APPLY,
+                has_discount=entity == "order_items" and has_discount,
+            )
+        )
     for entity in SNAPSHOT_LAYOUTS:
         if entity in counts:
             statements.extend(_write_entity_sql(core_schema, entity))
@@ -81,6 +100,12 @@ END AS status
             f"SELECT CAST(CASE WHEN {_CAN_APPLY} THEN 'injected-before-commit' "
             "ELSE '0' END AS INTEGER) FROM apply_status"
         )
+    quarantine_counts = " ".join(
+        f"UNION ALL SELECT '{entity}', 'quarantined', COUNT(*), CAST(0 AS BIGINT), '' "
+        f"FROM validated_{entity} WHERE rejection_reason IS NOT NULL AND {_CAN_APPLY} "
+        "HAVING COUNT(*) > 0"
+        for entity in counts
+    )
     statements.append(
         "SELECT '_batch' AS entity, CASE "
         "WHEN status = 'ready' AND EXISTS (SELECT 1 FROM apply_errors) "
@@ -89,44 +114,28 @@ END AS status
         "CAST(0 AS BIGINT) AS repeated, "
         "CAST('' AS VARCHAR(65535)) AS sample_key FROM apply_status "
         f"UNION ALL SELECT * FROM apply_errors WHERE {_READY} "
-        f"UNION ALL SELECT * FROM apply_summary WHERE {_CAN_APPLY}"
+        f"UNION ALL SELECT * FROM apply_summary WHERE {_CAN_APPLY} {quarantine_counts}"
     )
     return statements
 
 
 def _validation_sql(core_schema: str, counts: dict[str, int]) -> str:
     checks = [f"SELECT * FROM apply_summary WHERE decision NOT IN ({_DECISIONS})"]
-    if "order_items" in counts:
-        checks.append(
-            "SELECT 'order_items', 'invalid_discount', COUNT(*), 0, MIN(item_id) "
-            "FROM stage_order_items WHERE discount_amount < 0 "
-            "OR discount_amount > quantity * unit_price HAVING COUNT(*) > 0"
-        )
     for entity, expected in counts.items():
         checks.append(
             f"SELECT '{entity}', 'classification_count_mismatch', 0, 0, '' "
             "WHERE COALESCE((SELECT SUM(versions + repeated) FROM apply_summary "
-            f"WHERE entity = '{entity}'), 0) <> {expected}"
+            f"WHERE entity = '{entity}'), 0) "
+            f"+ (SELECT COUNT(*) FROM validated_{entity} "
+            f"WHERE rejection_reason IS NOT NULL) <> {expected}"
         )
-        key = SNAPSHOT_LAYOUTS[entity][0][0]
-        for column, parent in _REFERENCES.get(entity, ()):
-            parent_key = SNAPSHOT_LAYOUTS[parent][0][0]
-            match = same_key_sql(f"parent.{parent_key}", f"child.{column}")
-            missing = (
-                f"NOT EXISTS (SELECT 1 FROM {core_schema}.{parent} parent "
-                f"WHERE {match})"
-            )
-            if parent in counts:
-                missing += (
-                    f" AND NOT EXISTS (SELECT 1 FROM classified_{parent} parent "
-                    f"WHERE parent.decision IN ({_ACCEPTED}) AND {match})"
-                )
-            checks.append(
-                f"SELECT '{entity}', 'missing_{column}', COUNT(*), 0, MIN(child.{key}) "
-                f"FROM classified_{entity} child "
-                f"WHERE child.decision IN ({_ACCEPTED}) AND {missing} "
-                "HAVING COUNT(*) > 0"
-            )
+    for entity, layout in SNAPSHOT_LAYOUTS.items():
+        key = layout[0][0]
+        checks.append(
+            f"SELECT '{entity}', 'duplicate_core_key', COUNT(*), 0, {key} "
+            f"FROM {core_schema}.{entity} GROUP BY {key}, OCTET_LENGTH({key}) "
+            "HAVING COUNT(*) > 1"
+        )
     return "CREATE TEMP TABLE apply_errors AS " + " UNION ALL ".join(checks)
 
 
