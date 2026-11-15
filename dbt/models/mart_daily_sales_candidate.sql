@@ -1,3 +1,5 @@
+{{ config(materialized='table', alias='mart_daily_sales_candidate' ~ var('sales_candidate_suffix', '')) }}
+
 -- Core stores order timestamps in UTC.
 select
     cast(orders.order_date as date) as order_date,

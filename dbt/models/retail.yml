@@ -8,7 +8,7 @@ sources:
       - name: order_items
 
 models:
-  - name: mart_daily_sales
+  - name: mart_daily_sales_candidate
     description: Net sales in EUR by UTC order date for paid, shipped, and delivered orders.
     columns:
       - name: order_date

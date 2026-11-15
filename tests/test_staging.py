@@ -513,8 +513,8 @@ def test_prefect_rejects_incremental_version_conflict_without_retry(
 
 
 @pytest.mark.usefixtures("prefect_server")
-@pytest.mark.parametrize("failure", [None, "stage", "dbt"])
-def test_run_snapshot_cli_runs_dbt_only_after_verified_core_load(
+@pytest.mark.parametrize("failure", [None, "stage", "build", "publish"])
+def test_run_snapshot_cli_publishes_only_after_core_load_and_dbt_build(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str | None
 ) -> None:
     # The runner checkout only needs the dbt project. The publisher owns local data.
@@ -542,22 +542,28 @@ def test_run_snapshot_cli_runs_dbt_only_after_verified_core_load(
 
     process = MagicMock()
     process.__enter__.return_value = process
-    process.stdout = ["dbt build complete\n"]
-    process.wait.return_value = 1 if failure == "dbt" else 0
+    process.stdout = ["dbt command output\n"]
+    commands: list[list[str]] = []
+    candidate_vars: dict[str, str] = {}
 
     def start_dbt(command: list[str], **kwargs: object) -> MagicMock:
         assert redshift.core_statements[2].startswith(
             "DELETE FROM core_demo_flow.order_items WHERE "
         )
-        assert command[:5] == [
-            "dbt",
-            "--no-use-colors",
-            "build",
-            "--project-dir",
-            str(project_dir),
-        ]
-        assert command[5] == "--vars"
-        assert json.loads(command[6]) == {"core_schema": "core_demo_flow"}
+        assert command[:2] == ["dbt", "--no-use-colors"]
+        assert command[-4:-1] == ["--project-dir", str(project_dir), "--vars"]
+        variables = json.loads(command[-1])
+        assert variables["core_schema"] == "core_demo_flow"
+        assert variables["sales_candidate_suffix"].startswith("_")
+        arguments = command[2:-4]
+        commands.append(arguments)
+        if arguments == ["build"]:
+            candidate_vars.update(variables)
+            process.wait.return_value = int(failure == "build")
+        else:
+            assert arguments == ["run-operation", "publish_daily_sales"]
+            assert variables == candidate_vars
+            process.wait.return_value = int(failure == "publish")
         return process
 
     # Leave subprocess handling for Prefect itself untouched.
@@ -571,18 +577,22 @@ def test_run_snapshot_cli_runs_dbt_only_after_verified_core_load(
             main()
         assert redshift.core_statements == []
         fake_subprocess.Popen.assert_not_called()
-    elif failure == "dbt":
+    elif failure == "build":
         with pytest.raises(RuntimeError, match="dbt build failed with exit code 1"):
             main()
-        fake_subprocess.Popen.assert_called_once()
+        assert commands == [["build"]]
     else:
-        main()
-        fake_subprocess.Popen.assert_called_once()
+        if failure == "publish":
+            with pytest.raises(RuntimeError, match="publish_daily_sales failed"):
+                main()
+        else:
+            main()
+        assert commands == [["build"], ["run-operation", "publish_daily_sales"]]
 
 
 @pytest.mark.usefixtures("prefect_server")
 @pytest.mark.parametrize(
-    "scenario", ["fresh", "resume", "changed-manifest", "changed-file"]
+    "scenario", ["fresh", "resume", "exact-replay", "changed-manifest", "changed-file"]
 )
 def test_run_deliveries_gates_warehouse_writes_and_dbt(
     monkeypatch: pytest.MonkeyPatch,
@@ -599,24 +609,21 @@ def test_run_deliveries_gates_warehouse_writes_and_dbt(
     monkeypatch.setenv("RETAIL_REDSHIFT_WORKGROUP", "retail-dev")
     monkeypatch.setenv("RETAIL_REDSHIFT_DATABASE", "retail")
     monkeypatch.setenv("RETAIL_CORE_SCHEMA", "core_demo_flow")
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "retail-pipeline",
-            "run-deliveries",
-            "--dataset-id",
-            "demo-v1",
-            "--through",
-            "2026-11-10",
-        ],
-    )
+    uri = f"s3://{BUCKET}/raw/demo-v1/daily-002/manifest.json"
+    arguments = ["--dataset-id", "demo-v1", "--through", "2026-11-10"]
+    if scenario == "exact-replay":
+        arguments = [uri]
+    monkeypatch.setattr("sys.argv", ["retail-pipeline", "run-deliveries", *arguments])
 
     s3 = PublishedObjects()
     for batch in ("daily-002", "daily-001", "late-001"):
         s3.objects.update(PublishedObjects(incremental=True, batch_id=batch).objects)
     ledger = {}
     if scenario != "fresh":
-        for batch in ("snapshot-001", "daily-001"):
+        applied = ["snapshot-001", "daily-001"]
+        if scenario == "exact-replay":
+            applied.append("daily-002")
+        for batch in applied:
             published = read_published_delivery(
                 s3, f"s3://{BUCKET}/raw/demo-v1/{batch}/manifest.json"
             )
@@ -665,6 +672,17 @@ def test_run_deliveries_gates_warehouse_writes_and_dbt(
         with pytest.raises(DeliverySelectionError, match="SHA-256 mismatch"):
             main()
         assert events == []
+    elif scenario == "exact-replay":
+        main()
+        assert json.loads(capsys.readouterr().out) == [
+            {
+                "dataset_id": "demo-v1",
+                "batch_id": "daily-002",
+                "status": "already_applied",
+                "counts": {},
+            }
+        ]
+        assert events == ["dbt"]
     else:
         main()
         result = json.loads(capsys.readouterr().out)

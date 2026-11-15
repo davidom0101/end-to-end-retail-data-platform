@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import TypedDict, cast
+from uuid import uuid4
 
 import boto3
 from prefect import flow, get_run_logger, task
@@ -177,16 +178,28 @@ def _apply_incremental(
     )
 
 
-@task(name="dbt-build", persist_result=False)
+@task(name="build-and-publish-mart", persist_result=False)
 def _build_mart(core_schema: str, project_dir: Path) -> None:
+    variables = {
+        "core_schema": core_schema,
+        "sales_candidate_suffix": f"_{uuid4().hex}",
+    }
+    _run_dbt(["build"], project_dir, variables)
+    _run_dbt(["run-operation", "publish_daily_sales"], project_dir, variables)
+    get_run_logger().info("Published the validated mart_daily_sales view")
+
+
+def _run_dbt(
+    arguments: list[str], project_dir: Path, variables: dict[str, str]
+) -> None:
     command = [
         "dbt",
         "--no-use-colors",
-        "build",
+        *arguments,
         "--project-dir",
         str(project_dir),
         "--vars",
-        json.dumps({"core_schema": core_schema}),
+        json.dumps(variables),
     ]
     logger = get_run_logger()
     with subprocess.Popen(
@@ -202,7 +215,9 @@ def _build_mart(core_schema: str, project_dir: Path) -> None:
                 logger.info("%s", line.rstrip())
         exit_code = process.wait()
     if exit_code:
-        raise RuntimeError(f"dbt build failed with exit code {exit_code}")
+        raise RuntimeError(
+            f"dbt {' '.join(arguments)} failed with exit code {exit_code}"
+        )
 
 
 def _required_env(name: str) -> str:
