@@ -56,7 +56,7 @@ def parse_settings(argv: list[str] | None = None) -> PipelineSettings:
         description="Display the pipeline configuration without connecting to AWS.",
         epilog="Commands: validate-manifest, upload-delivery, upload-snapshot, "
         "stage-snapshot, load-snapshot, run-snapshot, discover-deliveries, "
-        "stage-incremental.",
+        "stage-incremental, classify-incremental.",
     )
     options = (
         ("--dataset-path", "RETAIL_DATASET_PATH", "Local dataset directory"),
@@ -119,6 +119,9 @@ def main() -> None:
         return
     if arguments[:1] == ["stage-incremental"]:
         _stage_incremental_command(arguments[1:])
+        return
+    if arguments[:1] == ["classify-incremental"]:
+        _classify_incremental_command(arguments[1:])
         return
 
     settings = parse_settings(arguments)
@@ -278,6 +281,20 @@ def _stage_incremental_command(arguments: list[str]) -> None:
     from retail_pipeline.flows import run_incremental_staging
 
     counts = run_incremental_staging(args.source_manifest_uri)
+    print(json.dumps(counts, indent=2))
+
+
+def _classify_incremental_command(arguments: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="retail-pipeline classify-incremental",
+        description="Preview incremental v1 decisions against the demo target.",
+    )
+    parser.add_argument("source_manifest_uri")
+    args = parser.parse_args(arguments)
+
+    from retail_pipeline.flows import run_incremental_classification
+
+    counts = run_incremental_classification(args.source_manifest_uri)
     print(json.dumps(counts, indent=2))
 
 

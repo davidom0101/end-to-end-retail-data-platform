@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from time import monotonic, sleep
 from typing import Protocol, TypedDict
 
+from retail_pipeline.classification import (
+    classification_sql,
+    classification_summary_sql,
+)
 from retail_pipeline.discovery import (
     DeliverySelectionError,
     PublishedDelivery,
@@ -122,6 +126,83 @@ def stage_incremental(
     database: str,
 ) -> dict[str, int]:
     """Verify one incremental v1 delivery in session-local staging tables."""
+    counts, _ = _stage_incremental(
+        s3, redshift, published, workgroup=workgroup, database=database, keep_alive=0
+    )
+    return counts
+
+
+def classify_incremental(
+    s3: SnapshotSource,
+    redshift: RedshiftClient,
+    published: PublishedDelivery,
+    *,
+    workgroup: str,
+    database: str,
+    core_schema: str,
+) -> dict[str, dict[str, int]]:
+    """Stage a v1 delivery, then preview its decisions against an existing target."""
+    _validate_core_schema(core_schema)
+    counts, session_id = _stage_incremental(
+        s3, redshift, published, workgroup=workgroup, database=database, keep_alive=60
+    )
+    if not session_id:
+        raise SnapshotStagingError("Redshift did not return the staging session ID")
+
+    statements = [classification_sql(entity, core_schema) for entity in counts]
+    statements.append(classification_summary_sql(counts))
+    batch = redshift.batch_execute_statement(
+        Sqls=statements, SessionId=session_id, SessionKeepAliveSeconds=0
+    )
+    rows = _last_batch_result(redshift, batch["Id"])
+    return _read_classification(rows, counts)
+
+
+def _read_classification(
+    rows: list[list[dict[str, str | int]]], staged_counts: dict[str, int]
+) -> dict[str, dict[str, int]]:
+    summary = {
+        entity: dict.fromkeys(("insert", "update", "duplicate", "stale"), 0)
+        for entity in staged_counts
+    }
+    errors = {
+        "conflict_in_delivery": "Version conflict within the delivery",
+        "conflict_with_core": "Version conflict with current core",
+        "invalid_version": "Invalid source version",
+        "invalid_core_version": "Invalid core version",
+        "duplicate_core_key": "Duplicate business key in core",
+    }
+    for entity_cell, decision_cell, versions, repeated, sample in rows:
+        entity = str(entity_cell["stringValue"])
+        decision = str(decision_cell["stringValue"])
+        if decision in errors:
+            raise SnapshotStagingError(
+                f"{errors[decision]} for {entity} key {sample['stringValue']!r}"
+            )
+        if entity not in summary or decision not in summary[entity]:
+            raise SnapshotStagingError(
+                f"Unexpected classification: {entity} {decision}"
+            )
+        summary[entity][decision] += int(versions["longValue"])
+        summary[entity]["duplicate"] += int(repeated["longValue"])
+
+    classified_counts = {
+        entity: sum(counts.values()) for entity, counts in summary.items()
+    }
+    if classified_counts != staged_counts:
+        raise SnapshotStagingError("Classification counts differ from verified staging")
+    return summary
+
+
+def _stage_incremental(
+    s3: SnapshotSource,
+    redshift: RedshiftClient,
+    published: PublishedDelivery,
+    *,
+    workgroup: str,
+    database: str,
+    keep_alive: int,
+) -> tuple[dict[str, int], str | None]:
     if published.delivery.kind != "incremental":
         raise SnapshotStagingError("Expected an incremental delivery manifest")
     layouts = v1_layouts(published.delivery)
@@ -140,8 +221,12 @@ def stage_incremental(
             f"THEN 1 END) AS invalid_ids FROM stage_{entity}"
         )
     statements.append(" UNION ALL ".join(count_queries))
-    rows, _ = _run_staging_batch(
-        redshift, statements, workgroup=workgroup, database=database, keep_alive=0
+    rows, session_id = _run_staging_batch(
+        redshift,
+        statements,
+        workgroup=workgroup,
+        database=database,
+        keep_alive=keep_alive,
     )
     actual_counts = _check_row_counts(rows, expected_counts)
     invalid = {
@@ -151,7 +236,7 @@ def stage_incremental(
     }
     if invalid:
         raise SnapshotStagingError(f"Invalid event entity_type or record_id: {invalid}")
-    return actual_counts
+    return actual_counts, session_id
 
 
 def load_snapshot(

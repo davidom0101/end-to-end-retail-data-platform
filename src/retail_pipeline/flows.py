@@ -20,6 +20,7 @@ from retail_pipeline.staging import (
     LoadedSnapshot,
     RedshiftClient,
     StagedSnapshotLoad,
+    classify_incremental,
     commit_snapshot_load,
     read_published_snapshot,
     stage_incremental,
@@ -174,4 +175,24 @@ def run_incremental_staging(source_manifest_uri: str) -> dict[str, int]:
         published = _read_manifest(s3, source_manifest_uri)
         return _stage_incremental(
             s3, redshift, published, workgroup=workgroup, database=database
+        )
+
+
+@flow(name="incremental-classification", persist_result=False)
+def run_incremental_classification(
+    source_manifest_uri: str,
+) -> dict[str, dict[str, int]]:
+    """Preview the decisions for one incremental delivery in an existing demo target."""
+    workgroup = _required_env("RETAIL_REDSHIFT_WORKGROUP")
+    database = _required_env("RETAIL_REDSHIFT_DATABASE")
+    core_schema = _required_env("RETAIL_CORE_SCHEMA")
+    with _runner_clients() as (s3, redshift):
+        published = _read_manifest(s3, source_manifest_uri)
+        return classify_incremental(
+            s3,
+            redshift,
+            published,
+            workgroup=workgroup,
+            database=database,
+            core_schema=core_schema,
         )
