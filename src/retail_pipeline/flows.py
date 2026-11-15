@@ -3,15 +3,17 @@
 import json
 import os
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, cast
 
 import boto3
 from prefect import flow, get_run_logger, task
+from prefect.client.schemas.objects import State
+from prefect.states import get_state_exception
 
 from retail_pipeline.classification import CLASSIFICATION_DECISIONS
 from retail_pipeline.discovery import (
@@ -28,8 +30,9 @@ from retail_pipeline.staging import (
     AppliedDelivery,
     LoadedSnapshot,
     RedshiftClient,
+    RetryableWarehouseError,
     SnapshotStagingError,
-    StagedSnapshotLoad,
+    WarehouseWaitTimeout,
     apply_incremental,
     classify_incremental,
     commit_snapshot_load,
@@ -38,6 +41,7 @@ from retail_pipeline.staging import (
     stage_incremental,
     stage_snapshot_for_load,
 )
+from retail_pipeline.transient import is_transient_aws_error
 
 
 @dataclass(frozen=True)
@@ -48,7 +52,27 @@ class DeliveryRun:
     counts: dict[str, dict[str, int]]
 
 
-@task(name="read-published-manifest", persist_result=False)
+def _retry_transient_failure(_task: object, _run: object, state: State) -> bool:
+    error = cast(BaseException, get_state_exception(state))
+    return is_transient_aws_error(error) or isinstance(
+        error, (RetryableWarehouseError, WarehouseWaitTimeout)
+    )
+
+
+class _RetryOptions(TypedDict):
+    retries: int
+    retry_delay_seconds: list[float]
+    retry_condition_fn: Callable[[object, object, State], bool]
+
+
+_RETRY_OPTIONS: _RetryOptions = {
+    "retries": 2,
+    "retry_delay_seconds": [2, 5],
+    "retry_condition_fn": _retry_transient_failure,
+}
+
+
+@task(name="read-published-manifest", persist_result=False, **_RETRY_OPTIONS)
 def _read_manifest(
     s3: SnapshotSource, source_manifest_uri: str, *, historical_only: bool = False
 ) -> PublishedDelivery:
@@ -65,29 +89,7 @@ def _read_manifest(
     return published
 
 
-@task(name="stage-snapshot", persist_result=False)
-def _stage(
-    s3: SnapshotSource,
-    redshift: RedshiftClient,
-    published: PublishedDelivery,
-    *,
-    workgroup: str,
-    database: str,
-    core_schema: str,
-) -> StagedSnapshotLoad:
-    staged = stage_snapshot_for_load(
-        s3,
-        redshift,
-        published,
-        workgroup=workgroup,
-        database=database,
-        core_schema=core_schema,
-    )
-    get_run_logger().info("Verified staged row counts: %s", staged.snapshot.row_counts)
-    return staged
-
-
-@task(name="stage-incremental", persist_result=False)
+@task(name="stage-incremental", persist_result=False, **_RETRY_OPTIONS)
 def _stage_incremental(
     s3: SnapshotSource,
     redshift: RedshiftClient,
@@ -103,16 +105,23 @@ def _stage_incremental(
     return counts
 
 
-@task(name="load-core", persist_result=False)
-def _load_core(redshift: RedshiftClient, staged: StagedSnapshotLoad) -> LoadedSnapshot:
-    loaded = commit_snapshot_load(redshift, staged)
-    get_run_logger().info(
-        "Snapshot %s in %s: %s", loaded.status, loaded.core_schema, loaded.row_counts
+_classify_incremental = task(
+    name="classify-incremental-delivery",
+    persist_result=False,
+    **_RETRY_OPTIONS,
+)(classify_incremental)
+
+
+@task(name="read-applied-batches", persist_result=False, **_RETRY_OPTIONS)
+def _read_ledger(
+    redshift: RedshiftClient, *, workgroup: str, database: str, core_schema: str
+) -> dict[tuple[str, str], AppliedBatch]:
+    return read_applied_batches(
+        redshift, workgroup=workgroup, database=database, core_schema=core_schema
     )
-    return loaded
 
 
-@task(name="discover-published-deliveries", persist_result=False)
+@task(name="discover-published-deliveries", persist_result=False, **_RETRY_OPTIONS)
 def _discover(
     s3: VerifiedDeliverySource, dataset_id: str, through: date
 ) -> list[PublishedDelivery]:
@@ -128,7 +137,7 @@ def _discover(
     return deliveries
 
 
-@task(name="verify-published-delivery", persist_result=False)
+@task(name="verify-published-delivery", persist_result=False, **_RETRY_OPTIONS)
 def _verified_replay(
     s3: VerifiedDeliverySource,
     published: PublishedDelivery,
@@ -148,7 +157,7 @@ def _verified_replay(
     return recorded is not None
 
 
-@task(name="apply-incremental-delivery", persist_result=False)
+@task(name="apply-incremental-delivery", persist_result=False, **_RETRY_OPTIONS)
 def _apply_incremental(
     s3: SnapshotSource,
     redshift: RedshiftClient,
@@ -228,6 +237,7 @@ def _dbt_project() -> Path:
     return project
 
 
+@task(name="apply-historical-snapshot", persist_result=False, **_RETRY_OPTIONS)
 def _apply_snapshot(
     s3: SnapshotSource,
     redshift: RedshiftClient,
@@ -237,7 +247,7 @@ def _apply_snapshot(
     database: str,
     core_schema: str,
 ) -> LoadedSnapshot:
-    staged = _stage(
+    staged = stage_snapshot_for_load(
         s3,
         redshift,
         published,
@@ -245,7 +255,13 @@ def _apply_snapshot(
         database=database,
         core_schema=core_schema,
     )
-    return _load_core(redshift, staged)
+    logger = get_run_logger()
+    logger.info("Verified staged row counts: %s", staged.snapshot.row_counts)
+    loaded = commit_snapshot_load(redshift, staged)
+    logger.info(
+        "Snapshot %s in %s: %s", loaded.status, loaded.core_schema, loaded.row_counts
+    )
+    return loaded
 
 
 @flow(name="historical-snapshot", persist_result=False)
@@ -258,7 +274,7 @@ def run_snapshot(source_manifest_uri: str) -> LoadedSnapshot:
 
     with _runner_clients() as (s3, redshift):
         published = _read_manifest(s3, source_manifest_uri, historical_only=True)
-        ledger = read_applied_batches(
+        ledger = _read_ledger(
             redshift, workgroup=workgroup, database=database, core_schema=core_schema
         )
         delivery = published.delivery
@@ -312,7 +328,7 @@ def run_incremental_classification(
     core_schema = _required_env("RETAIL_CORE_SCHEMA")
     with _runner_clients() as (s3, redshift):
         published = _read_manifest(s3, source_manifest_uri)
-        return classify_incremental(
+        return _classify_incremental(
             s3,
             redshift,
             published,
@@ -332,7 +348,7 @@ def run_incremental_application(source_manifest_uri: str) -> AppliedDelivery:
         published = _read_manifest(s3, source_manifest_uri)
         if published.delivery.kind != "incremental":
             raise SnapshotStagingError("Expected an incremental delivery manifest")
-        ledger = read_applied_batches(
+        ledger = _read_ledger(
             redshift, workgroup=workgroup, database=database, core_schema=core_schema
         )
         delivery = published.delivery
@@ -378,7 +394,7 @@ def run_deliveries(
         if not deliveries:
             return []
 
-        ledger = read_applied_batches(
+        ledger = _read_ledger(
             redshift, workgroup=workgroup, database=database, core_schema=core_schema
         )
         for published in deliveries:

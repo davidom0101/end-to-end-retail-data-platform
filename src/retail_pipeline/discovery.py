@@ -17,6 +17,7 @@ from retail_pipeline.manifest import (
     parse_batch_manifest,
     parse_snapshot_manifest,
 )
+from retail_pipeline.transient import is_transient_aws_error
 
 _BUCKET_PATTERN = r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]"
 _SOURCE_URI = re.compile(
@@ -113,6 +114,8 @@ def verify_delivery_files(
                 Bucket=published.bucket, Key=key, ChecksumMode="ENABLED"
             )
         except ClientError as exc:
+            if is_transient_aws_error(exc):
+                raise
             raise DeliverySelectionError(
                 f"Cannot verify s3://{published.bucket}/{key}"
             ) from exc

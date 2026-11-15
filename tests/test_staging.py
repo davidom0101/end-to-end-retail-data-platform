@@ -8,16 +8,19 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from botocore.exceptions import ClientError, ReadTimeoutError
 from prefect.testing.utilities import prefect_test_harness
 
-from retail_pipeline import flows
+from retail_pipeline import flows, staging
 from retail_pipeline.cli import main
 from retail_pipeline.discovery import DeliverySelectionError, read_published_delivery
+from retail_pipeline.manifest import ManifestValidationError
 from retail_pipeline.staging import (
     AppliedBatch,
     AppliedDelivery,
     LoadedSnapshot,
     SnapshotStagingError,
+    WarehouseOutcomeUnknown,
     load_snapshot,
     stage_incremental,
     stage_snapshot,
@@ -106,6 +109,7 @@ class RedshiftBatch:
         WorkgroupName: str = "",
         Database: str = "",
         SessionId: str = "",
+        ClientToken: str = "",
     ) -> dict:
         if SessionId:
             assert SessionId == "verified-staging-session"
@@ -329,6 +333,183 @@ def test_core_load_rejects_target_outside_demo_namespace() -> None:
 def prefect_server() -> Iterator[None]:
     with prefect_test_harness():
         yield
+
+
+@pytest.mark.usefixtures("prefect_server")
+@pytest.mark.parametrize(
+    ("failure", "expected_attempts"),
+    [("throttled", 2), ("unavailable", 3), ("checksum", 1)],
+)
+def test_prefect_retries_transient_s3_checks_only(
+    failure: str, expected_attempts: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s3 = PublishedObjects(incremental=True)
+    key = "raw/demo-v1/daily-001/manifest.json"
+    published = read_published_delivery(s3, f"s3://{BUCKET}/{key}")
+    head = MagicMock(wraps=s3.head_object)
+    if failure == "throttled":
+        head.side_effect = [
+            ClientError({"Error": {"Code": "SlowDown"}}, "HeadObject"),
+            s3.head_object(
+                Bucket=BUCKET,
+                Key="raw/demo-v1/daily-001/orders/part-001.parquet",
+                ChecksumMode="ENABLED",
+            ),
+        ]
+    elif failure == "unavailable":
+        head.side_effect = ClientError(
+            {"ResponseMetadata": {"HTTPStatusCode": 503}}, "HeadObject"
+        )
+    else:
+        head.return_value = {}
+    monkeypatch.setattr(s3, "head_object", head)
+    verify = flows._verified_replay.with_options(retry_delay_seconds=0)
+
+    if failure == "throttled":
+        assert verify(s3, published, None) is False
+    elif failure == "unavailable":
+        with pytest.raises(ClientError):
+            verify(s3, published, None)
+    else:
+        with pytest.raises(DeliverySelectionError, match="SHA-256 mismatch"):
+            verify(s3, published, None)
+    assert head.call_count == expected_attempts
+
+
+@pytest.mark.usefixtures("prefect_server")
+def test_prefect_rejects_unsupported_schema_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s3 = PublishedObjects(incremental=True)
+    key = "raw/demo-v1/daily-001/manifest.json"
+    s3.objects[key]["files"][0]["schema_version"] = 2
+    read = MagicMock(wraps=s3.get_object)
+    monkeypatch.setattr(s3, "get_object", read)
+    read_manifest = flows._read_manifest.with_options(retry_delay_seconds=0)
+
+    with pytest.raises(ManifestValidationError, match="unsupported incremental schema"):
+        read_manifest(s3, f"s3://{BUCKET}/{key}")
+    read.assert_called_once_with(Bucket=BUCKET, Key=key)
+
+
+@pytest.mark.usefixtures("prefect_server")
+@pytest.mark.parametrize(
+    "outcome", ["lost-receipt", "ledger-confirms", "unknown", "rolled-back"]
+)
+def test_prefect_resolves_warehouse_outcome_before_resubmitting(
+    outcome: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s3 = PublishedObjects()
+    published = read_published_delivery(s3, SOURCE_URI)
+    redshift = RedshiftBatch(COUNTS)
+    original_submit = redshift.batch_execute_statement
+    original_describe = redshift.describe_statement
+    original_result = redshift.get_statement_result
+    tokens = []
+    staging_batches = []
+    core_polls = []
+    ledger = {}
+
+    def submit(**args):
+        if not args.get("SessionId"):
+            staging_batches.append(args)
+            return original_submit(**args)
+        tokens.append(args["ClientToken"])
+        if outcome == "lost-receipt" and len(tokens) == 1:
+            raise ReadTimeoutError(endpoint_url="https://redshift-data.example")
+        return original_submit(**args)
+
+    def describe(*, Id):
+        if Id == "core-batch":
+            core_polls.append(Id)
+            if outcome == "rolled-back" and len(tokens) == 1:
+                return {"Status": "FAILED", "Error": "Serializable isolation violation"}
+        return original_describe(Id=Id)
+
+    def result(*, Id):
+        if Id == "core-batch:last" and outcome in {"ledger-confirms", "unknown"}:
+            raise ReadTimeoutError(endpoint_url="https://redshift-data.example")
+        return original_result(Id=Id)
+
+    if outcome == "ledger-confirms":
+        ledger[("demo-v1", "snapshot-001")] = AppliedBatch(
+            "historical", published.manifest_sha256
+        )
+    read_ledger = MagicMock(return_value=ledger)
+    monkeypatch.setattr(staging, "read_applied_batches", read_ledger)
+    monkeypatch.setattr(redshift, "batch_execute_statement", submit)
+    monkeypatch.setattr(redshift, "describe_statement", describe)
+    monkeypatch.setattr(redshift, "get_statement_result", result)
+
+    apply = flows._apply_snapshot.with_options(retry_delay_seconds=0)
+    settings = {
+        "workgroup": "retail-dev",
+        "database": "retail",
+        "core_schema": "core_demo",
+    }
+    if outcome == "unknown":
+        with pytest.raises(
+            WarehouseOutcomeUnknown, match="no matching committed ledger"
+        ):
+            apply(s3, redshift, published, **settings)
+    else:
+        loaded = apply(s3, redshift, published, **settings)
+        assert loaded.status == ("already_applied" if ledger else "applied")
+
+    if outcome == "lost-receipt":
+        assert len(tokens) == 2 and tokens[0] == tokens[1]
+    elif outcome == "rolled-back":
+        assert len(tokens) == 2 and tokens[0] != tokens[1]
+    else:
+        assert len(tokens) == 1
+    assert len(staging_batches) == (2 if outcome == "rolled-back" else 1)
+    assert len(core_polls) == (1 if outcome == "lost-receipt" else 2)
+    assert read_ledger.call_count == (0 if outcome == "lost-receipt" else 1)
+
+
+@pytest.mark.usefixtures("prefect_server")
+def test_prefect_rejects_incremental_version_conflict_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s3 = PublishedObjects(incremental=True)
+    redshift = RedshiftBatch({"orders": 1}, invalid_ids=0)
+    uri = f"s3://{BUCKET}/raw/demo-v1/daily-001/manifest.json"
+    published = read_published_delivery(s3, uri)
+    original_result = redshift.get_statement_result
+
+    def result(*, Id):
+        if Id == "core-batch:last":
+            return {
+                "Records": [
+                    [{"stringValue": "_batch"}, {"stringValue": "rejected"}],
+                    [
+                        {"stringValue": "orders"},
+                        {"stringValue": "conflict_with_core"},
+                        {"longValue": 1},
+                        {"longValue": 0},
+                        {"stringValue": "order-1"},
+                    ],
+                ]
+            }
+        return original_result(Id=Id)
+
+    submit = MagicMock(wraps=redshift.batch_execute_statement)
+    monkeypatch.setattr(redshift, "batch_execute_statement", submit)
+    monkeypatch.setattr(redshift, "get_statement_result", result)
+    apply = flows._apply_incremental.with_options(retry_delay_seconds=0)
+
+    with pytest.raises(
+        SnapshotStagingError, match="Version conflict with current core"
+    ):
+        apply(
+            s3,
+            redshift,
+            published,
+            workgroup="retail-dev",
+            database="retail",
+            core_schema="core_demo",
+        )
+    assert sum("SessionId" in call.kwargs for call in submit.call_args_list) == 1
 
 
 @pytest.mark.usefixtures("prefect_server")

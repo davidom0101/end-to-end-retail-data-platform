@@ -6,6 +6,9 @@ from collections import Counter
 from dataclasses import dataclass
 from time import monotonic, sleep
 from typing import NotRequired, Protocol, TypedDict
+from uuid import uuid4
+
+from botocore.exceptions import BotoCoreError, ClientError
 
 from retail_pipeline.application import application_statements, lock_core_sql
 from retail_pipeline.classification import (
@@ -21,6 +24,7 @@ from retail_pipeline.discovery import (
     read_s3_object,
 )
 from retail_pipeline.manifest import BATCH_ID_PATTERN, SNAPSHOT_LAYOUTS, v1_layouts
+from retail_pipeline.transient import is_aws_throttled, is_transient_aws_error
 
 _REDSHIFT_TYPES = {
     "string": "VARCHAR(65535)",
@@ -30,6 +34,7 @@ _REDSHIFT_TYPES = {
     "money": "DECIMAL(12,2)",
     "bool": "BOOLEAN",
 }
+_RECOVERY_POLL_SECONDS = 15
 
 
 class _Statement(TypedDict, total=False):
@@ -46,6 +51,9 @@ class _StatementResult(TypedDict):
     NextToken: NotRequired[str]
 
 
+type _ResultRows = list[list[dict[str, str | int]]]
+
+
 class RedshiftClient(Protocol):
     def batch_execute_statement(
         self,
@@ -55,6 +63,7 @@ class RedshiftClient(Protocol):
         WorkgroupName: str = ...,
         Database: str = ...,
         SessionId: str = ...,
+        ClientToken: str = ...,
     ) -> _Statement: ...
 
     def describe_statement(self, *, Id: str) -> _Statement: ...
@@ -66,6 +75,22 @@ class RedshiftClient(Protocol):
 
 class SnapshotStagingError(ValueError):
     """A published delivery could not be staged or verified."""
+
+
+class RetryableWarehouseError(SnapshotStagingError):
+    """A statement rolled back after a transient database failure."""
+
+
+class WarehouseWaitTimeout(SnapshotStagingError):
+    """Polling stopped before a statement reached a terminal state."""
+
+
+class WarehouseResultUnavailable(SnapshotStagingError):
+    """A completed statement returned no result receipt."""
+
+
+class WarehouseOutcomeUnknown(SnapshotStagingError):
+    """The write could not be reconciled and must not be retried automatically."""
 
 
 @dataclass(frozen=True)
@@ -82,6 +107,8 @@ class StagedSnapshotLoad:
     dataset_id: str
     batch_id: str
     manifest_sha256: str
+    workgroup: str
+    database: str
 
 
 @dataclass(frozen=True)
@@ -110,6 +137,7 @@ def read_applied_batches(
     workgroup: str,
     database: str,
     core_schema: str,
+    timeout_seconds: int = 300,
 ) -> dict[tuple[str, str], AppliedBatch]:
     """Read the target ledger, with an absent ledger representing a fresh target."""
     _validate_core_schema(core_schema)
@@ -122,6 +150,7 @@ def read_applied_batches(
         workgroup=workgroup,
         database=database,
         keep_alive=0,
+        timeout_seconds=timeout_seconds,
     )
     if rows[0][0]["longValue"] == 0:
         return {}
@@ -134,6 +163,7 @@ def read_applied_batches(
         workgroup=workgroup,
         database=database,
         keep_alive=0,
+        timeout_seconds=timeout_seconds,
     )
     ledger = {
         (str(dataset["stringValue"]), str(batch["stringValue"])): AppliedBatch(
@@ -237,12 +267,18 @@ def apply_incremental(
     counts, session_id = _stage_incremental_for_core(
         s3, redshift, published, workgroup=workgroup, database=database
     )
-    batch = redshift.batch_execute_statement(
-        Sqls=application_statements(core_schema, published, counts),
-        SessionId=session_id,
-        SessionKeepAliveSeconds=0,
+    rows = _run_core_batch(
+        redshift,
+        application_statements(core_schema, published, counts),
+        session_id,
+        batch_key=(published.delivery.dataset_id, published.delivery.batch_id),
+        expected=AppliedBatch("incremental", published.manifest_sha256),
+        workgroup=workgroup,
+        database=database,
+        core_schema=core_schema,
     )
-    rows = _last_batch_result(redshift, batch["Id"])
+    if rows is None:
+        return AppliedDelivery("already_applied", {})
     status_rows = [row for row in rows if row[0]["stringValue"] == "_batch"]
     if len(status_rows) != 1:
         raise SnapshotStagingError("Missing incremental application outcome")
@@ -423,6 +459,8 @@ def stage_snapshot_for_load(
         published.delivery.dataset_id,
         published.delivery.batch_id,
         published.manifest_sha256,
+        workgroup,
+        database,
     )
 
 
@@ -487,13 +525,22 @@ END AS status
             "SELECT status FROM snapshot_status",
         ]
     )
-    batch = redshift.batch_execute_statement(
-        Sqls=statements, SessionId=staged.session_id, SessionKeepAliveSeconds=0
+    rows = _run_core_batch(
+        redshift,
+        statements,
+        staged.session_id,
+        batch_key=(dataset_id, batch_id),
+        expected=AppliedBatch("historical", checksum),
+        workgroup=staged.workgroup,
+        database=staged.database,
+        core_schema=core_schema,
     )
-    rows = _last_batch_result(redshift, batch["Id"])
-    if len(rows) != 1 or len(rows[0]) != 1:
+    if rows is None:
+        outcome: str | int | None = "already_applied"
+    elif len(rows) != 1 or len(rows[0]) != 1:
         raise SnapshotStagingError("Missing snapshot application outcome")
-    outcome = rows[0][0].get("stringValue")
+    else:
+        outcome = rows[0][0].get("stringValue")
     if outcome == "changed_batch":
         raise SnapshotStagingError(
             "Applied batch key has a different manifest or delivery kind"
@@ -624,24 +671,139 @@ def _run_staging_batch(
     workgroup: str,
     database: str,
     keep_alive: int,
-) -> tuple[list[list[dict[str, str | int]]], str | None]:
+    timeout_seconds: int = 300,
+) -> tuple[_ResultRows, str | None]:
     batch = redshift.batch_execute_statement(
         WorkgroupName=workgroup,
         Database=database,
         Sqls=statements,
         SessionKeepAliveSeconds=keep_alive,
     )
-    rows = _last_batch_result(redshift, batch["Id"])
+    rows = _last_batch_result(redshift, batch["Id"], timeout_seconds=timeout_seconds)
     return rows, batch.get("SessionId")
 
 
+def _run_core_batch(
+    redshift: RedshiftClient,
+    statements: list[str],
+    session_id: str,
+    *,
+    batch_key: tuple[str, str],
+    expected: AppliedBatch,
+    workgroup: str,
+    database: str,
+    core_schema: str,
+) -> _ResultRows | None:
+    """Resolve an uncertain write before allowing a new warehouse attempt."""
+    token = uuid4().hex
+    statement_id = None
+    try:
+        statement_id = _submit_core_batch(redshift, statements, session_id, token)
+        try:
+            return _last_batch_result(redshift, statement_id)
+        except (ClientError, BotoCoreError, WarehouseWaitTimeout) as exc:
+            if not (
+                is_transient_aws_error(exc) or isinstance(exc, WarehouseWaitTimeout)
+            ):
+                raise
+            # Recheck the existing statement before falling back to the ledger.
+            return _last_batch_result(
+                redshift, statement_id, timeout_seconds=_RECOVERY_POLL_SECONDS
+            )
+    except (
+        ClientError,
+        BotoCoreError,
+        RetryableWarehouseError,
+        WarehouseWaitTimeout,
+        WarehouseResultUnavailable,
+        WarehouseOutcomeUnknown,
+    ) as exc:
+        if statement_id is None and not isinstance(exc, WarehouseOutcomeUnknown):
+            raise
+        reference = (
+            f"statement {statement_id}" if statement_id else f"submission token {token}"
+        )
+        dataset_id, batch_id = batch_key
+        unknown = (
+            f"Cannot confirm warehouse outcome for {dataset_id}/{batch_id} "
+            f"({reference})"
+        )
+        try:
+            ledger = read_applied_batches(
+                redshift,
+                workgroup=workgroup,
+                database=database,
+                core_schema=core_schema,
+                timeout_seconds=_RECOVERY_POLL_SECONDS,
+            )
+        except (SnapshotStagingError, ClientError, BotoCoreError) as ledger_error:
+            raise WarehouseOutcomeUnknown(
+                f"{unknown}; ledger check failed"
+            ) from ledger_error
+        recorded = ledger.get(batch_key)
+        if recorded == expected:
+            return None
+        if recorded is not None:
+            raise SnapshotStagingError(
+                "Applied batch key has a different manifest or kind"
+            ) from exc
+        if isinstance(exc, RetryableWarehouseError):
+            raise
+        raise WarehouseOutcomeUnknown(
+            f"{unknown}; no matching committed ledger entry"
+        ) from exc
+
+
+def _submit_core_batch(
+    redshift: RedshiftClient, statements: list[str], session_id: str, token: str
+) -> str:
+    try:
+        batch = redshift.batch_execute_statement(
+            Sqls=statements,
+            SessionId=session_id,
+            SessionKeepAliveSeconds=0,
+            ClientToken=token,
+        )
+    except (ClientError, BotoCoreError) as exc:
+        if not is_transient_aws_error(exc):
+            raise
+        # A capacity rejection on the first SDK attempt rules out a prior submission.
+        if (
+            isinstance(exc, ClientError)
+            and is_aws_throttled(exc)
+            and exc.response.get("ResponseMetadata", {}).get("RetryAttempts") == 0
+        ):
+            raise
+        try:
+            # Recover the receipt with exactly the original Data API request token.
+            batch = redshift.batch_execute_statement(
+                Sqls=statements,
+                SessionId=session_id,
+                SessionKeepAliveSeconds=0,
+                ClientToken=token,
+            )
+        except (ClientError, BotoCoreError) as retry_error:
+            # Redshift can reject the replay once the staging session has closed.
+            raise WarehouseOutcomeUnknown(
+                "Could not recover submission receipt"
+            ) from retry_error
+    statement_id = batch.get("Id")
+    if statement_id is None:
+        raise WarehouseOutcomeUnknown("Missing statement ID in submission receipt")
+    return statement_id
+
+
 def _last_batch_result(
-    redshift: RedshiftClient, statement_id: str
-) -> list[list[dict[str, str | int]]]:
-    finished = _wait_for_statement(redshift, statement_id)
+    redshift: RedshiftClient, statement_id: str, *, timeout_seconds: int = 300
+) -> _ResultRows:
+    finished = _wait_for_statement(
+        redshift, statement_id, timeout_seconds=timeout_seconds
+    )
     substatements = finished.get("SubStatements", [])
     if not substatements or not substatements[-1].get("HasResultSet"):
-        raise SnapshotStagingError(f"Missing final query result for {statement_id}")
+        raise WarehouseResultUnavailable(
+            f"Missing final query result for {statement_id}"
+        )
     result_id = substatements[-1]["Id"]
     result = redshift.get_statement_result(Id=result_id)
     rows = result["Records"]
@@ -695,8 +857,10 @@ def _verify_copy_manifest(
         raise SnapshotStagingError(f"COPY manifest omits source files: {key}")
 
 
-def _wait_for_statement(client: RedshiftClient, statement_id: str) -> _Statement:
-    deadline = monotonic() + 300
+def _wait_for_statement(
+    client: RedshiftClient, statement_id: str, *, timeout_seconds: int = 300
+) -> _Statement:
+    deadline = monotonic() + timeout_seconds
     while monotonic() < deadline:
         result = client.describe_statement(Id=statement_id)
         status = result["Status"]
@@ -704,10 +868,17 @@ def _wait_for_statement(client: RedshiftClient, statement_id: str) -> _Statement
             return result
         if status not in {"SUBMITTED", "PICKED", "STARTED"}:
             error = result.get("Error", "")
-            raise SnapshotStagingError(
-                f"Redshift statement {statement_id}: {status}. {error}"
-            )
+            message = f"Redshift statement {statement_id}: {status}. {error}"
+            if status in {"FAILED", "ABORTED"} and re.search(
+                r"serializable isolation violation|deadlock detected|"
+                r"could not obtain lock|"
+                r"\bSQLSTATE[\s:=]+(?:40001|40P01|55P03)\b",
+                error,
+                re.IGNORECASE,
+            ):
+                raise RetryableWarehouseError(message)
+            raise SnapshotStagingError(message)
         sleep(2)
-    raise SnapshotStagingError(
+    raise WarehouseWaitTimeout(
         f"Redshift statement {statement_id} may still be running after the timeout"
     )
