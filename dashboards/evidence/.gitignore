@@ -1,0 +1,6 @@
+/node_modules/
+/.evidence/
+/.evidence-queries/
+/.svelte-kit/
+/build/
+/sources/**/connection.options.yaml
