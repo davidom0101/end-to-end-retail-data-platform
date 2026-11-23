@@ -1,0 +1,12 @@
+retail:
+  target: ci
+  outputs:
+    ci:
+      type: redshift
+      host: localhost
+      port: 5439
+      dbname: retail
+      schema: analytics_ci
+      user: ci_parse_only
+      password: unused
+      threads: 1
