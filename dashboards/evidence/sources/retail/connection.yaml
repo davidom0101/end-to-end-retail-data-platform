@@ -1,2 +1,5 @@
 name: retail
 type: redshift
+options:
+  ssl:
+    rejectUnauthorized: true
