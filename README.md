@@ -1,6 +1,14 @@
 # Retail Data Platform
 
-An end to end retail data engineering project that processes daily Parquet deliveries from S3 into Redshift, transforms and tests the data with dbt, and presents sales, product and customer metrics in Evidence. Prefect coordinates the pipeline, which demonstrates incremental loading, duplicate handling, late arriving data, invalid row quarantine and safe recovery from failures.
+A retailer needs reliable daily sales reporting, but its data deliveries can contain duplicates, late orders, invalid records and corrections to past transactions. The pipeline must handle these changes without double counting sales or publishing incomplete results.
+
+This project processes Parquet deliveries from S3 into Redshift, transforms and tests the data with dbt, and presents sales, product and customer metrics in Evidence. Prefect coordinates incremental loading, validation and failure recovery.
+
+## Data
+
+Retailer data covers customers, products, orders and order items. Parquet deliveries include a historical snapshot, daily updates and optional failure and data quality scenarios.
+
+See the [dataset notes](data/demo-v1/README.md) for volumes and expected results.
 
 ## Architecture
 
