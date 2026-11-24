@@ -1,0 +1,15 @@
+{
+  "dataset_id": "demo-v1",
+  "batch_id": "conflict-current-001",
+  "kind": "incremental",
+  "arrival_date": "2026-11-13",
+  "files": [
+    {
+      "path": "products/part-001.parquet",
+      "entity_type": "products",
+      "schema_version": 1,
+      "row_count": 1,
+      "sha256": "6836fd4ae1c192704565b208d5d6f4d400fc6e6d93920b55e308bf9b983927a7"
+    }
+  ]
+}

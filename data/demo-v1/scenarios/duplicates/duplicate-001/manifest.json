@@ -1,0 +1,15 @@
+{
+  "dataset_id": "demo-v1",
+  "batch_id": "duplicate-001",
+  "kind": "incremental",
+  "arrival_date": "2026-11-13",
+  "files": [
+    {
+      "path": "products/part-001.parquet",
+      "entity_type": "products",
+      "schema_version": 1,
+      "row_count": 2,
+      "sha256": "5db95f6b7d07671bcdf2714c9f62d13bd4149b674b147757fb9e31231b67208c"
+    }
+  ]
+}

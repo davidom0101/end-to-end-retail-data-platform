@@ -1,0 +1,3 @@
+# Immutable delivery checksums must survive Git checkout on every platform.
+data/demo-v1/**/manifest.json -text
+data/demo-v1/**/*.parquet -text

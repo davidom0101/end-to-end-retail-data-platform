@@ -1,0 +1,36 @@
+{
+  "dataset_id": "demo-v1",
+  "batch_id": "daily-001",
+  "kind": "incremental",
+  "arrival_date": "2026-11-11",
+  "files": [
+    {
+      "path": "customers/part-001.parquet",
+      "entity_type": "customers",
+      "schema_version": 1,
+      "row_count": 1,
+      "sha256": "80b618ed43db9720a3109f2c7d3f720031fddb7a3acbab7baf8f9ddd75d2f3ea"
+    },
+    {
+      "path": "products/part-001.parquet",
+      "entity_type": "products",
+      "schema_version": 1,
+      "row_count": 1,
+      "sha256": "ac20e44958d7a1c5eaeda0bd21842fb4f03e5c1232cde4fb3bec24c4deb05fb2"
+    },
+    {
+      "path": "orders/part-001.parquet",
+      "entity_type": "orders",
+      "schema_version": 1,
+      "row_count": 51,
+      "sha256": "1df8cb428fb08c45ed50bb2d226739d79f5adfb6a00ea2090ec731aad5000b0f"
+    },
+    {
+      "path": "order_items/part-001.parquet",
+      "entity_type": "order_items",
+      "schema_version": 1,
+      "row_count": 100,
+      "sha256": "c998ced6ca1df73bc8aaeef319884eb45bd35fd7855dd060d2c545e2e105b7d5"
+    }
+  ]
+}

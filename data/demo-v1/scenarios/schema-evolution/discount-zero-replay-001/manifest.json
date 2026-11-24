@@ -1,0 +1,15 @@
+{
+  "dataset_id": "demo-v1",
+  "batch_id": "discount-zero-replay-001",
+  "kind": "incremental",
+  "arrival_date": "2026-11-13",
+  "files": [
+    {
+      "path": "order_items/part-001.parquet",
+      "entity_type": "order_items",
+      "schema_version": 2,
+      "row_count": 1,
+      "sha256": "0cd2c0c6bc2ec369a65a5965257ea2680556bb44eeaedf04ef463a417e76f766"
+    }
+  ]
+}

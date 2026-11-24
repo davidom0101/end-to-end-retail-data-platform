@@ -1,0 +1,22 @@
+{
+  "dataset_id": "demo-v1",
+  "batch_id": "late-001",
+  "kind": "incremental",
+  "arrival_date": "2026-11-13",
+  "files": [
+    {
+      "path": "orders/part-001.parquet",
+      "entity_type": "orders",
+      "schema_version": 1,
+      "row_count": 1,
+      "sha256": "d6e9fc5abb25e052ec5aa494768a9c7e15cd81caf5fd281a5c3746482f2d69ff"
+    },
+    {
+      "path": "order_items/part-001.parquet",
+      "entity_type": "order_items",
+      "schema_version": 1,
+      "row_count": 1,
+      "sha256": "fe62983c4c6e800eb8a3be7fc003dc03ee32971c64e23477d5532ed8c6a6b9fb"
+    }
+  ]
+}

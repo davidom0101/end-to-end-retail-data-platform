@@ -1,0 +1,15 @@
+{
+  "dataset_id": "demo-v1",
+  "batch_id": "discount-001",
+  "kind": "incremental",
+  "arrival_date": "2026-11-13",
+  "files": [
+    {
+      "path": "order_items/part-001.parquet",
+      "entity_type": "order_items",
+      "schema_version": 2,
+      "row_count": 2,
+      "sha256": "3dfbbaaca0d0650fc7a10b98c4d7c6235a0f010d5d12bdbea3869c1cc432b53f"
+    }
+  ]
+}

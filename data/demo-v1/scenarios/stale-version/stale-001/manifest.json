@@ -1,0 +1,15 @@
+{
+  "dataset_id": "demo-v1",
+  "batch_id": "stale-001",
+  "kind": "incremental",
+  "arrival_date": "2026-11-13",
+  "files": [
+    {
+      "path": "products/part-001.parquet",
+      "entity_type": "products",
+      "schema_version": 1,
+      "row_count": 1,
+      "sha256": "2fedf9a212b0719fa88b92af5a08f1b91584bec66d6531cc6ceb90f5ffbbda12"
+    }
+  ]
+}
