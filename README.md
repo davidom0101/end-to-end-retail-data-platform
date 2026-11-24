@@ -1,6 +1,6 @@
 # Retail Data Platform
 
-Retail deliveries can contain duplicate events, late orders, invalid rows and corrections that change historical sales. This project turns those deliveries into validated sales, product and customer reporting, with safe replay and failure recovery.
+An end to end retail data engineering project that processes daily Parquet deliveries from S3 into Redshift, transforms and tests the data with dbt, and presents sales, product and customer metrics in Evidence. Prefect coordinates the pipeline, which demonstrates incremental loading, duplicate handling, late arriving data, invalid row quarantine and safe recovery from failures.
 
 ## Architecture
 
@@ -16,32 +16,32 @@ flowchart LR
     V --> E[Evidence extracts and dashboard]
 ```
 
-| Tool | Purpose and design choice |
+| Tool | Purpose |
 | --- | --- |
-| Python 3.13 / uv | Validate and ingest deliveries with locked dependencies |
-| S3 / Parquet | Daily batch deliveries; manifests select exact files |
-| Redshift Serverless | SQL staging, transactional core updates and analytical storage |
-| Prefect | Local orchestration, task retries and run logs |
-| dbt | Versioned transformations and tests before reporting publication |
-| Evidence | SQL and Markdown dashboards reviewed alongside pipeline code |
+| Python 3.13 / uv | Ingestion and locked dependencies |
+| S3 / Parquet | Daily deliveries with exact file manifests |
+| Redshift Serverless | Staging, core tables and analytics |
+| Prefect | Local orchestration, retries and logs |
+| dbt | Transformations and tests before publication |
+| Evidence | SQL and Markdown dashboards |
 
-- Pipeline starts at a published S3 manifest; only the standalone retailer simulator needs local dataset files.
+- Pipeline input: an S3 manifest URI. Only the retailer simulator uses local files.
 - [Data contract](docs/data_contract.md) · [Demo dataset and expected results](data/demo-v1/README.md)
 
 ## Verified results
 
 | Check | Recorded result |
 | --- | --- |
-| Offline CI | [Passed on a clean checkout](https://github.com/davidom0101/end-to-end-retail-data-platform/actions/runs/45269642190); 65 pytest tests, Ruff, mypy and dbt parsing |
+| Offline CI | [Passed on a clean checkout](https://github.com/davidom0101/end-to-end-retail-data-platform/actions/runs/45269642190), 65 pytest tests, Ruff, mypy and dbt parsing |
 | Live dbt build | 8 models and 32 data tests passed |
-| Failure recovery | Deliberately failed dbt test preserved published sales; same-delivery retry skipped core and published the correction |
-| Evidence | Clean Day 2: €386,849.69; discount correction: €386,846.69 across 4,465 eligible orders |
+| Failure recovery | Failed dbt test preserved reporting, retry skipped core and published the correction |
+| Evidence | Clean Day 2: €386,849.69, discount correction: €386,846.69 across 4,465 eligible orders |
 
 ![Evidence dashboard after the discount correction](docs/evidence/dashboard-sales.png)
 
 ## Quickstart
 
-### 1. Install and check without AWS
+### 1. Local checks (no AWS)
 
 - Requires Git, uv and Python 3.13.
 
@@ -56,15 +56,15 @@ uv run pytest -q
 uv run dbt parse --no-partial-parse --project-dir dbt --profiles-dir dbt/ci
 ```
 
-### 2. Configure the AWS walkthrough
+### 2. AWS setup
 
 | Prerequisite | Requirement |
 | --- | --- |
-| Additional tools | Node.js 22/npm for Evidence; AWS CLI v2 and Session Manager plugin |
-| AWS | Private S3 bucket; private Redshift Serverless workgroup in the same Region; default COPY role with bucket read access |
-| Runner access | S3 read/list, upload permissions for the simulator, Redshift Data API and temporary database credentials |
-| Private connection | SSM-managed EC2 instance reaching Redshift on 5439; dbt hostname resolves to the local tunnel while TLS retains the real hostname |
-| Isolation | Fresh `core_demo_<name>` and analytics schemas for each independent walkthrough |
+| Tools | Node.js 22/npm, AWS CLI v2, Session Manager plugin |
+| AWS | Private S3 and Redshift in one Region, default COPY role can read the bucket |
+| Permissions | S3 read/list/upload, Redshift Data API and temporary database credentials |
+| Connection | SSM managed EC2 instance with access to Redshift port 5439 |
+| Isolation | Fresh `core_demo_<name>` and analytics schemas per scenario |
 
 ```bash
 export AWS_PROFILE='<aws-profile>'
@@ -79,7 +79,7 @@ export RETAIL_TUNNEL_INSTANCE_ID='<managed-instance-id>'
 export PREFECT_SERVER_EPHEMERAL_ENABLED='true'
 ```
 
-- Save as `~/.dbt/profiles.yml` (dbt's default location).
+- Save as `~/.dbt/profiles.yml`:
 
 ```yaml
 retail:
@@ -98,7 +98,7 @@ retail:
       threads: 1
 ```
 
-- In another terminal with the same environment variables, leave this tunnel running:
+- Open the tunnel in another terminal with the same environment variables:
 
 ```bash
 aws ssm start-session --region "$AWS_REGION" --target "$RETAIL_TUNNEL_INSTANCE_ID" \
@@ -106,11 +106,11 @@ aws ssm start-session --region "$AWS_REGION" --target "$RETAIL_TUNNEL_INSTANCE_I
   --parameters "host=$RETAIL_REDSHIFT_HOST,portNumber=5439,localPortNumber=$RETAIL_REDSHIFT_PORT"
 ```
 
-- For dbt on Windows, temporarily add `127.0.0.1 <private-workgroup-hostname>` to `C:/Windows/System32/drivers/etc/hosts` using an administrator editor.
+- In an administrator editor, add `127.0.0.1 <private-workgroup-hostname>` to `C:/Windows/System32/drivers/etc/hosts` temporarily.
 
-### 3. Publish inputs and run
+### 3. Upload and run
 
-- Run commands individually; continue only when each succeeds.
+- Continue only when each command succeeds.
 
 ```bash
 root="s3://$RETAIL_RAW_BUCKET/raw/demo-v1"
@@ -128,8 +128,8 @@ uv run retail-pipeline run-deliveries --dataset-id demo-v1 --through 2026-11-12
 
 ### 4. View Evidence
 
-- Configure a dedicated reader: reporting-schema `USAGE`, `SELECT` on the three published views, and that schema on its search path; no core-table access.
-- The pinned Evidence connector requires a reader password stored in Redshift's MD5 format; TLS verification remains enabled.
+- Reader access: reporting schema `USAGE` and `SELECT` on its three views, set that schema as the reader's search path.
+- The connector requires an MD5 format Redshift password, TLS verification stays enabled.
 - Set `EVIDENCE_SOURCE__retail__user` and `EVIDENCE_SOURCE__retail__password` locally.
 
 ```bash
@@ -142,32 +142,24 @@ npm run sources -- --strict
 npm run dev -- --host 127.0.0.1 --port 4187
 ```
 
-- Open `http://127.0.0.1:4187`; refresh sources after each successful publication.
-- After stopping the preview with Ctrl+C, run `cd ../..` to return to the repository root.
+- Open `http://127.0.0.1:4187`, refresh sources after publication.
+- After Ctrl+C, run `cd ../..` to return to the repo root.
 
-### 5. End the session
+### Cleanup
 
-1. Stop Evidence and the Session Manager tunnel with Ctrl+C in their respective terminals.
-2. Remove the temporary Redshift hostname entry from the administrator-managed hosts file.
-3. Stop the dedicated demo tunnel instance when finished:
+- Stop Evidence and the tunnel with Ctrl+C.
+- Remove the temporary Redshift hosts file entry.
+- Stop the demo tunnel instance:
 
 ```bash
 aws ec2 stop-instances --region "$AWS_REGION" --instance-ids "$RETAIL_TUNNEL_INSTANCE_ID"
 ```
 
-- Existing S3, EC2 storage and Redshift resources remain billable after session cleanup.
+- Other retained AWS resources may still incur charges.
 
-## Transaction and replay behavior
+## Reliability
 
-| Boundary | Behavior |
-| --- | --- |
-| Delivery | Immutable S3 objects; source manifest published last; COPY reads only listed files |
-| Core commit | Lock ledger/core; validate and classify; accepted rows, quarantine and applied-batch ledger commit together |
-| Replay | Same dataset/batch and verified manifest/files skip core writes; changed content fails |
-| Reporting | dbt builds candidate marts and runs tests; one transaction refreshes all three published marts |
-| Failure/retry | Before commit: rollback; after commit: keep core and old reporting; rerun the same URI to resume |
-| Audit | Prefect logs plus a separate warehouse audit transaction; abrupt runner termination can leave warehouse audit incomplete |
-| Limits | One reporting writer per analytics schema; small Parquet parts; infrastructure provisioned separately |
-
+- Core changes, quarantined rows and the batch ledger commit together.
+- Rerunning the same manifest skips committed core writes and resumes processing.
+- Reporting updates only after dbt tests pass, failures preserve the previous published results.
 - Failure demonstration: from Day 1, run `uv run retail-pipeline run-deliveries "$root/daily-002/manifest.json" --inject-failure after-commit`, then repeat without the flag.
-- Verification query: `select sum(net_sales), sum(order_count) from analytics_portfolio.mart_daily_sales;`
